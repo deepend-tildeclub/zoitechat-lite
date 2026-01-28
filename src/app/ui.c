@@ -58,13 +58,8 @@ static ChatPage *zcl_page_for_child(UiState *st, GtkWidget *child);
 // Userlist interactions (only used if a userlist TreeView exists on the page).
 static void zcl_userlist_row_activated(GtkTreeView *tv, GtkTreePath *path, GtkTreeViewColumn *col, gpointer user_data);
 static gboolean zcl_userlist_button_press(GtkWidget *w, GdkEventButton *ev, gpointer user_data);
-static gchar *zcl_userlist_get_nick_at_path(GtkTreeView *tv, GtkTreePath *path);
 static gchar *zcl_userlist_normalize_nick(const gchar *s);
-static void zcl_userlist_menu_send_dm(GtkMenuItem *mi, gpointer user_data);
-static void zcl_userlist_menu_whois(GtkMenuItem *mi, gpointer user_data);
-static void zcl_userlist_menu_copy(GtkMenuItem *mi, gpointer user_data);
 
-static gboolean zcl_userlist_button_press(GtkWidget *w, GdkEventButton *ev, gpointer user_data);
 static void on_userlist_menu_send_dm(GtkMenuItem *mi, gpointer user_data);
 static void on_userlist_menu_whois(GtkMenuItem *mi, gpointer user_data);
 static void on_userlist_menu_copy(GtkMenuItem *mi, gpointer user_data);
@@ -111,9 +106,10 @@ get_or_create_page(UiState *st, const gchar *target) {
   page = chat_page_new(target);
   GtkWidget *root = chat_page_get_root(page);
 
-  if (!g_object_get_data(G_OBJECT(root), "zcl-target")) {
-    g_object_set_data_full(G_OBJECT(root), "zcl-target", g_strdup(target), g_free);
-  }
+  /* Ensure tab-building callbacks can always resolve the page/target. */
+  g_hash_table_insert(st->pages, g_strdup(target), page);
+  g_object_set_data_full(G_OBJECT(root), "zcl-target", g_strdup(target), g_free);
+
   GtkWidget *tab = gtk_label_new(target);
   gtk_widget_set_halign(tab, GTK_ALIGN_START);
 
@@ -155,8 +151,6 @@ get_or_create_page(UiState *st, const gchar *target) {
     g_signal_connect(uv, "row-activated", G_CALLBACK(zcl_userlist_row_activated), st);
   }
 
-
-  g_hash_table_insert(st->pages, g_strdup(target), page);
   return page;
 }
 
@@ -515,8 +509,11 @@ if (st->auto_join && *st->auto_join) {
   }
 
 
+static void zcl_whois_clear(void);
+
 static void
 on_client_disconnected(ZcClient *client, gint code, gchar *message, UiState *st) {
+  zcl_whois_clear();
   (void)client;
   gchar *status = g_strdup_printf("Disconnected (%d): %s", code, message ? message : "");
   const gboolean _plain = (code == 0) && (!message || !*message || g_strcmp0(message, "Disconnected") == 0);
@@ -534,6 +531,324 @@ append_server_line(UiState *st, const gchar *line) {
   ChatPage *status = get_or_create_page(st, "status");
   chat_page_append_fmt(status, "← %s", line);
 }
+
+/* ZCL_WHOIS_DIALOG_V1
+ * Collect WHOIS numerics and show them in a dialog instead of spamming status.
+ */
+typedef struct {
+  gchar *nick;
+  gchar *userhost;
+  gchar *realname;
+  gchar *server;
+  gchar *server_info;
+  gchar *account;
+  gchar *away;
+  gboolean is_oper;
+  gboolean is_secure;
+  guint idle_secs;
+  gint64 signon_ts;
+  gchar *channels_raw;
+} ZclWhoisPending;
+
+static ZclWhoisPending *zcl_whois = NULL;
+
+static void
+zcl_whois_clear(void) {
+  if (!zcl_whois) return;
+  g_free(zcl_whois->nick);
+  g_free(zcl_whois->userhost);
+  g_free(zcl_whois->realname);
+  g_free(zcl_whois->server);
+  g_free(zcl_whois->server_info);
+  g_free(zcl_whois->account);
+  g_free(zcl_whois->away);
+  g_free(zcl_whois->channels_raw);
+  g_free(zcl_whois);
+  zcl_whois = NULL;
+}
+
+static void
+zcl_whois_begin(const gchar *nick) {
+  zcl_whois_clear();
+  zcl_whois = g_new0(ZclWhoisPending, 1);
+  zcl_whois->nick = g_strdup(nick ? nick : "");
+}
+
+static gchar *
+zcl_format_duration(guint secs) {
+  guint h = secs / 3600;
+  guint m = (secs % 3600) / 60;
+  guint s = secs % 60;
+  if (h) return g_strdup_printf("%uh %um %us", h, m, s);
+  if (m) return g_strdup_printf("%um %us", m, s);
+  return g_strdup_printf("%us", s);
+}
+
+static gchar *
+zcl_wrap_words(const gchar *s, gint width, const gchar *indent) {
+  if (!s || !*s) return g_strdup("");
+  if (width < 10) width = 78;
+  if (!indent) indent = "";
+
+  gchar **toks = g_strsplit(s, " ", -1);
+  GString *out = g_string_new(NULL);
+
+  gint col = 0;
+  for (gchar **t = toks; t && *t; t++) {
+    if (!**t) continue;
+    gint need = (gint)strlen(*t) + 1;
+    if (col == 0) {
+      g_string_append(out, indent);
+      col = (gint)strlen(indent);
+    }
+    if (col + need > width) {
+      g_string_append(out, "\n");
+      g_string_append(out, indent);
+      col = (gint)strlen(indent);
+    }
+    g_string_append(out, *t);
+    g_string_append_c(out, ' ');
+    col += need;
+  }
+
+  g_strfreev(toks);
+
+  if (out->len && out->str[out->len - 1] == ' ')
+    g_string_truncate(out, out->len - 1);
+
+  return g_string_free(out, FALSE);
+}
+
+static gchar *
+zcl_whois_render_text(const ZclWhoisPending *w) {
+  GString *out = g_string_new(NULL);
+
+  g_string_append_printf(out, "WHOIS: %s\n\n", (w && w->nick && *w->nick) ? w->nick : "?");
+
+  if (w && w->userhost && *w->userhost)
+    g_string_append_printf(out, "User:      %s\n", w->userhost);
+
+  if (w && w->realname && *w->realname)
+    g_string_append_printf(out, "Real name: %s\n", w->realname);
+
+  if (w && w->server && *w->server) {
+    if (w->server_info && *w->server_info)
+      g_string_append_printf(out, "Server:    %s (%s)\n", w->server, w->server_info);
+    else
+      g_string_append_printf(out, "Server:    %s\n", w->server);
+  }
+
+  if (w && w->account && *w->account)
+    g_string_append_printf(out, "Account:   %s\n", w->account);
+
+  if (w && w->away && *w->away)
+    g_string_append_printf(out, "Away:      %s\n", w->away);
+
+  if (w && w->idle_secs) {
+    gchar *dur = zcl_format_duration(w->idle_secs);
+    g_string_append_printf(out, "Idle:      %s\n", dur);
+    g_free(dur);
+  }
+
+  if (w && w->signon_ts > 0) {
+    GDateTime *dt = g_date_time_new_from_unix_local(w->signon_ts);
+    if (dt) {
+      gchar *ts = g_date_time_format(dt, "%Y-%m-%d %H:%M:%S");
+      g_string_append_printf(out, "Signed on: %s\n", ts ? ts : "");
+      g_free(ts);
+      g_date_time_unref(dt);
+    }
+  }
+
+  if (w && (w->is_oper || w->is_secure)) {
+    g_string_append(out, "Flags:     ");
+    gboolean first = TRUE;
+    if (w->is_oper) {
+      g_string_append(out, "IRC operator");
+      first = FALSE;
+    }
+    if (w->is_secure) {
+      if (!first) g_string_append(out, ", ");
+      g_string_append(out, "secure connection");
+    }
+    g_string_append_c(out, '\n');
+  }
+
+  if (w && w->channels_raw && *w->channels_raw) {
+    gint n = 0;
+    gchar **toks = g_strsplit(w->channels_raw, " ", -1);
+    for (gchar **t = toks; t && *t; t++) {
+      if (**t) n++;
+    }
+    g_strfreev(toks);
+    g_string_append_printf(out, "Channels:  %d (see list)\n", n);
+  }
+
+  
+
+  return g_string_free(out, FALSE);
+}
+
+static gchar *
+zcl_whois_render_copy_text(const ZclWhoisPending *w) {
+  gchar *body = zcl_whois_render_text(w);
+  if (!w || !w->channels_raw || !*w->channels_raw) return body;
+
+  GString *out = g_string_new(body ? body : "");
+  g_free(body);
+
+  g_string_append(out, "\n\nChannels:\n");
+  gchar **toks = g_strsplit(w->channels_raw, " ", -1);
+  for (gchar **t = toks; t && *t; t++) {
+    if (!**t) continue;
+    g_string_append_printf(out, "  %s\n", *t);
+  }
+  g_strfreev(toks);
+
+  return g_string_free(out, FALSE);
+}
+
+static const gchar *
+zcl_channel_name_no_prefix(const gchar *tok) {
+  if (!tok) return "";
+  while (*tok && (*tok == '~' || *tok == '&' || *tok == '@' || *tok == '%' || *tok == '+')) tok++;
+  return tok;
+}
+
+static gint
+zcl_channel_cmp(gconstpointer a, gconstpointer b) {
+  const gchar *sa = *(const gchar * const *)a;
+  const gchar *sb = *(const gchar * const *)b;
+  const gchar *na = zcl_channel_name_no_prefix(sa);
+  const gchar *nb = zcl_channel_name_no_prefix(sb);
+
+  gint c = g_ascii_strcasecmp(na, nb);
+  if (c != 0) return c;
+  return g_ascii_strcasecmp(sa, sb);
+}
+
+static void
+zcl_whois_fill_channels_list(GtkListBox *lb, const gchar *raw) {
+  if (!lb) return;
+
+  /* Clear existing rows. */
+  GList *rows = gtk_container_get_children(GTK_CONTAINER(lb));
+  for (GList *l = rows; l; l = l->next) gtk_widget_destroy(GTK_WIDGET(l->data));
+  g_list_free(rows);
+
+  if (!raw || !*raw) {
+    GtkWidget *lbl = gtk_label_new("No channels");
+    gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+    gtk_list_box_insert(lb, lbl, -1);
+    return;
+  }
+
+  GPtrArray *arr = g_ptr_array_new_with_free_func(g_free);
+  gchar **toks = g_strsplit(raw, " ", -1);
+  for (gchar **t = toks; t && *t; t++) {
+    if (!**t) continue;
+    g_ptr_array_add(arr, g_strdup(*t));
+  }
+  g_strfreev(toks);
+
+  g_ptr_array_sort(arr, (GCompareFunc)zcl_channel_cmp);
+
+  for (guint i = 0; i < arr->len; i++) {
+    const gchar *tok = (const gchar *)g_ptr_array_index(arr, i);
+    GtkWidget *lbl = gtk_label_new(tok);
+    gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+    gtk_list_box_insert(lb, lbl, -1);
+  }
+
+  g_ptr_array_free(arr, TRUE);
+}
+
+static GtkWindow *
+zcl_parent_window(UiState *st) {
+  if (st && st->win && GTK_IS_WINDOW(st->win)) return GTK_WINDOW(st->win);
+  if (st && st->notebook) {
+    GtkWidget *toplevel = gtk_widget_get_toplevel(st->notebook);
+    if (GTK_IS_WINDOW(toplevel)) return GTK_WINDOW(toplevel);
+  }
+  return NULL;
+}
+
+static void
+zcl_whois_show_dialog(UiState *st) {
+  if (!zcl_whois || !zcl_whois->nick || !*zcl_whois->nick) return;
+
+  gchar *body = zcl_whois_render_text(zcl_whois);
+
+  GtkWidget *dlg = gtk_dialog_new_with_buttons(
+      "WHOIS",
+      zcl_parent_window(st),
+      GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+      "_Copy",
+      1,
+      "_Close",
+      GTK_RESPONSE_CLOSE,
+      NULL);
+
+  GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
+  gtk_container_set_border_width(GTK_CONTAINER(content), 12);
+
+  GtkWidget *paned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+  gtk_box_pack_start(GTK_BOX(content), paned, TRUE, TRUE, 0);
+
+  /* Left: channels list (scrollable). */
+  GtkWidget *left = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+
+  GtkWidget *ch_hdr = gtk_label_new(NULL);
+  gtk_label_set_markup(GTK_LABEL(ch_hdr), "<b>Channels</b>");
+  gtk_widget_set_halign(ch_hdr, GTK_ALIGN_START);
+  gtk_box_pack_start(GTK_BOX(left), ch_hdr, FALSE, FALSE, 0);
+
+  GtkWidget *ch_sw = gtk_scrolled_window_new(NULL, NULL);
+  gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(ch_sw), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+  gtk_widget_set_size_request(ch_sw, 240, 420);
+
+  GtkWidget *ch_list = gtk_list_box_new();
+  gtk_list_box_set_selection_mode(GTK_LIST_BOX(ch_list), GTK_SELECTION_NONE);
+  gtk_container_add(GTK_CONTAINER(ch_sw), ch_list);
+  gtk_box_pack_start(GTK_BOX(left), ch_sw, TRUE, TRUE, 0);
+
+  zcl_whois_fill_channels_list(GTK_LIST_BOX(ch_list), zcl_whois ? zcl_whois->channels_raw : NULL);
+
+  /* Right: formatted details text. */
+  GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
+  gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+  gtk_widget_set_size_request(sw, 600, 420);
+
+  GtkWidget *tv = gtk_text_view_new();
+  gtk_text_view_set_editable(GTK_TEXT_VIEW(tv), FALSE);
+  gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(tv), FALSE);
+  gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(tv), GTK_WRAP_WORD_CHAR);
+  gtk_text_view_set_monospace(GTK_TEXT_VIEW(tv), TRUE);
+
+  GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(tv));
+  gtk_text_buffer_set_text(buf, body, -1);
+
+  gtk_container_add(GTK_CONTAINER(sw), tv);
+
+  gtk_paned_pack1(GTK_PANED(paned), left, FALSE, FALSE);
+  gtk_paned_pack2(GTK_PANED(paned), sw, TRUE, FALSE);
+  gtk_paned_set_position(GTK_PANED(paned), 260);
+
+  gtk_widget_show_all(dlg);
+
+  gint resp = gtk_dialog_run(GTK_DIALOG(dlg));
+  if (resp == 1) {
+    GtkClipboard *cb = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+    gchar *all = zcl_whois_render_copy_text(zcl_whois);
+          gtk_clipboard_set_text(cb, all ? all : "", -1);
+          g_free(all);
+  }
+
+  gtk_widget_destroy(dlg);
+  g_free(body);
+}
+
+
 
 static void
 append_to_target(UiState *st, const gchar *target, const gchar *line) {
@@ -776,6 +1091,184 @@ if (text && text[0] == '') {
 
   /* Numerics and everything else go to status */
   {
+    const gboolean is_numeric =
+      (msg->command &&
+       strlen(msg->command) == 3 &&
+       g_ascii_isdigit((guchar)msg->command[0]) &&
+       g_ascii_isdigit((guchar)msg->command[1]) &&
+       g_ascii_isdigit((guchar)msg->command[2]));
+
+    if (is_numeric) {
+      // WHOIS pretty-print (common numerics). This keeps status output readable.
+      const gchar *wnick = zc_irc_message_param(msg, 1);
+      
+/* WHOIS dialog capture. If a /WHOIS is in progress, collect numerics for that nick
+ * and show a formatted dialog at 318 (end of WHOIS). */
+if (zcl_whois && zcl_whois->nick && *zcl_whois->nick && wnick &&
+    g_ascii_strcasecmp(wnick, zcl_whois->nick) == 0) {
+
+  /* 301 RPL_AWAY */
+  if (g_strcmp0(msg->command, "301") == 0) {
+    g_free(zcl_whois->away);
+    zcl_whois->away = g_strdup(msg->trailing ? msg->trailing : "");
+    return;
+  }
+
+  /* 311 RPL_WHOISUSER: <me> <nick> <user> <host> * :<realname> */
+  if (g_strcmp0(msg->command, "311") == 0) {
+    const gchar *user = zc_irc_message_param(msg, 2);
+    const gchar *host = zc_irc_message_param(msg, 3);
+    g_free(zcl_whois->userhost);
+    zcl_whois->userhost = g_strdup_printf("%s@%s", user ? user : "?", host ? host : "?");
+    g_free(zcl_whois->realname);
+    zcl_whois->realname = g_strdup(msg->trailing ? msg->trailing : "");
+    return;
+  }
+
+  /* 312 RPL_WHOISSERVER: <me> <nick> <server> :<info> */
+  if (g_strcmp0(msg->command, "312") == 0) {
+    g_free(zcl_whois->server);
+    zcl_whois->server = g_strdup(zc_irc_message_param(msg, 2));
+    g_free(zcl_whois->server_info);
+    zcl_whois->server_info = g_strdup(msg->trailing ? msg->trailing : "");
+    return;
+  }
+
+  /* 319 RPL_WHOISCHANNELS */
+  if (g_strcmp0(msg->command, "319") == 0) {
+    g_free(zcl_whois->channels_raw);
+    zcl_whois->channels_raw = g_strdup(msg->trailing ? msg->trailing : "");
+    return;
+  }
+
+  /* 317 RPL_WHOISIDLE: <me> <nick> <idle> <signon> :... */
+  if (g_strcmp0(msg->command, "317") == 0) {
+    const gchar *idle = zc_irc_message_param(msg, 2);
+    const gchar *signon = zc_irc_message_param(msg, 3);
+    zcl_whois->idle_secs = idle ? (guint)g_ascii_strtoull(idle, NULL, 10) : 0;
+    zcl_whois->signon_ts = signon ? (gint64)g_ascii_strtoll(signon, NULL, 10) : 0;
+    return;
+  }
+
+  /* 313 / 320: operator-ish lines */
+  if (g_strcmp0(msg->command, "313") == 0 || g_strcmp0(msg->command, "320") == 0) {
+    zcl_whois->is_oper = TRUE;
+    return;
+  }
+
+  /* 671: secure connection */
+  if (g_strcmp0(msg->command, "671") == 0) {
+    zcl_whois->is_secure = TRUE;
+    return;
+  }
+
+  /* 330: account */
+  if (g_strcmp0(msg->command, "330") == 0) {
+    g_free(zcl_whois->account);
+    zcl_whois->account = g_strdup(zc_irc_message_param(msg, 2));
+    return;
+  }
+
+  /* 318 RPL_ENDOFWHOIS */
+  if (g_strcmp0(msg->command, "318") == 0) {
+    zcl_whois_show_dialog(st);
+    zcl_whois_clear();
+    return;
+  }
+
+  /* Ignore other numerics for this WHOIS. */
+  return;
+}
+
+if (!wnick) wnick = zc_irc_message_param(msg, 0);
+      if (!wnick) wnick = "";
+
+      if (g_strcmp0(msg->command, "311") == 0) {
+        const gchar *user = zc_irc_message_param(msg, 2);
+        const gchar *host = zc_irc_message_param(msg, 3);
+        const gchar *real = msg->trailing ? msg->trailing : "";
+        gchar *line = g_strdup_printf("WHOIS %s: %s@%s (%s)", wnick, user ? user : "?", host ? host : "?", real);
+        append_server_line(st, line);
+        g_free(line);
+        return;
+      }
+
+      if (g_strcmp0(msg->command, "312") == 0) {
+        const gchar *srv = zc_irc_message_param(msg, 2);
+        const gchar *info = msg->trailing ? msg->trailing : "";
+        gchar *line = g_strdup_printf("WHOIS %s: server %s (%s)", wnick, srv ? srv : "?", info);
+        append_server_line(st, line);
+        g_free(line);
+        return;
+      }
+
+      if (g_strcmp0(msg->command, "313") == 0) {
+        gchar *line = g_strdup_printf("WHOIS %s: IRC operator", wnick);
+        append_server_line(st, line);
+        g_free(line);
+        return;
+      }
+
+      if (g_strcmp0(msg->command, "317") == 0) {
+        const gchar *idle_s = zc_irc_message_param(msg, 2);
+        const gchar *signon_s = zc_irc_message_param(msg, 3);
+        gint64 signon = signon_s ? g_ascii_strtoll(signon_s, NULL, 10) : 0;
+        GDateTime *dt = (signon > 0) ? g_date_time_new_from_unix_local(signon) : NULL;
+        gchar *when = dt ? g_date_time_format(dt, "%Y-%m-%d %H:%M:%S") : NULL;
+        gchar *line = g_strdup_printf("WHOIS %s: idle %ss, signon %s", wnick, idle_s ? idle_s : "?", when ? when : "?");
+        append_server_line(st, line);
+        g_free(line);
+        g_free(when);
+        if (dt) g_date_time_unref(dt);
+        return;
+      }
+
+      if (g_strcmp0(msg->command, "319") == 0) {
+        const gchar *chans = msg->trailing ? msg->trailing : "";
+        gchar *line = g_strdup_printf("WHOIS %s: channels %s", wnick, chans);
+        append_server_line(st, line);
+        g_free(line);
+        return;
+      }
+
+      if (g_strcmp0(msg->command, "330") == 0) {
+        const gchar *acct = zc_irc_message_param(msg, 2);
+        gchar *line = g_strdup_printf("WHOIS %s: account %s", wnick, acct ? acct : "?");
+        append_server_line(st, line);
+        g_free(line);
+        return;
+      }
+
+      if (g_strcmp0(msg->command, "671") == 0) {
+        gchar *line = g_strdup_printf("WHOIS %s: secure connection", wnick);
+        append_server_line(st, line);
+        g_free(line);
+        return;
+      }
+
+      if (g_strcmp0(msg->command, "378") == 0) {
+        const gchar *info = msg->trailing ? msg->trailing : "";
+        gchar *line = g_strdup_printf("WHOIS %s: %s", wnick, info);
+        append_server_line(st, line);
+        g_free(line);
+        return;
+      }
+
+      if (g_strcmp0(msg->command, "318") == 0) {
+        gchar *line = g_strdup_printf("WHOIS %s: end", wnick);
+        append_server_line(st, line);
+        g_free(line);
+        return;
+      }
+
+      // Cleaner default numeric output: prefer the human text.
+      if (msg->trailing && *msg->trailing) {
+        append_server_line(st, msg->trailing);
+        return;
+      }
+    }
+
+    // Fallback (non-numeric or no trailing)
     const gchar *p0 = (msg->params && msg->params->len > 0) ? (const gchar *)g_ptr_array_index(msg->params, 0) : "";
     gchar *line = g_strdup_printf("%s %s%s%s",
       msg->command,
@@ -823,186 +1316,476 @@ do_connect(UiState *st) {
   zc_client_connect_async(st->client, st->host, st->port, st->tls, NULL, connect_async_cb, st);
 }
 
+static gboolean
+zcl_send_raw_line(UiState *st, ChatPage *page, const gchar *raw) {
+  if (!raw || !*raw) return FALSE;
+  if (!st || !st->client) return FALSE;
+  if (!zc_client_is_connected(st->client)) {
+    if (page) chat_page_append(page, "Not connected.");
+    return FALSE;
+  }
+
+  GError *err = NULL;
+  gboolean ok = zc_client_send_raw(st->client, raw, &err);
+  if (!ok && page) {
+    chat_page_append_fmt(page, "Send failed: %s", err ? err->message : "unknown error");
+  }
+  g_clear_error(&err);
+  return ok;
+}
+
+static gchar *
+zcl_take_token(gchar **s) {
+  if (!s || !*s) return NULL;
+  gchar *p = *s;
+  g_strstrip(p);
+  if (!*p) return NULL;
+
+  gchar *sp = strchr(p, ' ');
+  if (sp) {
+    *sp = '\0';
+    sp++;
+    g_strstrip(sp);
+    *s = sp;
+  } else {
+    *s = p + strlen(p);
+  }
+  return p;
+}
+
 static void
 run_command(UiState *st, const gchar *target, const gchar *line) {
-  if (!line || !*line) return;
+  // Clean slash-command -> raw-line dispatch.
+  if (!st || !line) return;
 
-  const gchar *effective_target = target ? target : "status";
+  const gchar *effective_target = target && *target ? target : "status";
   ChatPage *page = get_or_create_page(st, effective_target);
 
-  if (line[0] != '/') {
-    if (!zc_client_is_connected(st->client)) {
-      chat_page_append(page, "Not connected.");
+  // "//foo" sends literal "/foo" as a message (common IRC client behavior).
+  if (line[0] == '/' && line[1] == '/') {
+    const gchar *msg = line + 1;
+
+    if (g_strcmp0(effective_target, "status") == 0) {
+      zcl_send_raw_line(st, page, msg);
       return;
     }
-    GError *error = NULL;
-    if (!zc_client_privmsg(st->client, effective_target, line, &error)) {
-      chat_page_append_fmt(page, "Send failed: %s", error->message);
-      g_clear_error(&error);
-    } else {
-      chat_page_append_fmt(page, "<%s> %s", st->nick ? st->nick : "me", line);
+
+	    if (!st->client || !zc_client_is_connected(st->client)) {
+	      chat_page_append(page, "Not connected.");
+      return;
+    }
+
+	    GError *err = NULL;
+	    zc_client_privmsg(st->client, effective_target, msg, &err);
+    if (err) {
+      chat_page_append_fmt(page, "Send failed: %s", err->message);
+      g_clear_error(&err);
     }
     return;
   }
 
-  /* Slash commands */
-  gchar **parts = g_strsplit(line + 1, " ", 2);
-  const gchar *cmd = parts[0] ? parts[0] : "";
-  const gchar *rest = parts[1] ? parts[1] : "";
-
-  if (g_ascii_strcasecmp(cmd, "join") == 0) {
-    if (!zc_client_is_connected(st->client)) {
-      chat_page_append(page, "Not connected.");
-    } else if (*rest) {
-      GError *error = NULL;
-      if (!zc_client_join(st->client, rest, &error)) {
-        chat_page_append_fmt(page, "JOIN failed: %s", error->message);
-        g_clear_error(&error);
-      } else {
-        get_or_create_page(st, rest);
-      }
+  // Non-command text: message in channels/queries, raw in status.
+  if (line[0] != '/') {
+    if (g_strcmp0(effective_target, "status") == 0) {
+      zcl_send_raw_line(st, page, line);
+      return;
     }
-  } else if (g_ascii_strcasecmp(cmd, "nick") == 0) {
-    if (*rest) {
-      g_free(st->nick);
-      st->nick = g_strdup(rest);
-      if (zc_client_is_connected(st->client)) {
-        GError *error = NULL;
-        gchar *raw = g_strdup_printf("NICK %s", rest);
-        (void)zc_client_send_raw(st->client, raw, &error);
-        if (error) {
-          chat_page_append_fmt(page, "NICK failed: %s", error->message);
-          g_clear_error(&error);
-        }
+
+	    if (!st->client || !zc_client_is_connected(st->client)) {
+	      chat_page_append(page, "Not connected.");
+      return;
+    }
+
+	    GError *err = NULL;
+	    zc_client_privmsg(st->client, effective_target, line, &err);
+    if (err) {
+      chat_page_append_fmt(page, "Send failed: %s", err->message);
+      g_clear_error(&err);
+    }
+    return;
+  }
+
+  // Parse "/cmd rest..."
+  gchar *tmp = g_strdup(line + 1);
+  g_strstrip(tmp);
+  if (!tmp[0]) { g_free(tmp); return; }
+
+  gchar *rest = strchr(tmp, ' ');
+  if (rest) {
+    *rest = '\0';
+    rest++;
+    g_strstrip(rest);
+  } else {
+    rest = (gchar *)"";
+  }
+
+  gchar *cmd = tmp;
+  for (gchar *p = cmd; *p; p++) *p = (gchar)g_ascii_tolower(*p);
+
+  typedef enum {
+    ZCL_CMD_RAW_REST,
+    ZCL_CMD_SIMPLE_REST,        // "CMD rest"
+    ZCL_CMD_MSG,                // /msg nick text => PRIVMSG nick :text
+    ZCL_CMD_NOTICE,             // /notice nick text
+    ZCL_CMD_ACTION,             // /me text => CTCP ACTION to current target
+    ZCL_CMD_JOIN,               // /join #chan1,#chan2 [keys]
+    ZCL_CMD_PART,               // /part [chan] [reason]
+    ZCL_CMD_TOPIC,              // /topic [chan] [topic]
+    ZCL_CMD_WHOIS,              // /whois nick
+    ZCL_CMD_NAMES,              // /names [chan]
+    ZCL_CMD_WHO,                // /who [mask]
+    ZCL_CMD_LIST,               // /list [args]
+    ZCL_CMD_MODE,               // /mode ...
+    ZCL_CMD_KICK,               // /kick [chan] nick [reason]
+    ZCL_CMD_INVITE,             // /invite nick [chan]
+    ZCL_CMD_AWAY,               // /away [msg]
+    ZCL_CMD_QUERY_UI,           // /query nick
+    ZCL_CMD_CLOSE_UI,           // /close
+    ZCL_CMD_SAY_UI,             // /say text (send as message, not raw)
+  } ZclCmdRule;
+
+  typedef struct {
+    const gchar *name;
+    ZclCmdRule rule;
+    const gchar *irc_cmd; // used by SIMPLE_REST
+  } ZclCmdSpec;
+
+  static const ZclCmdSpec table[] = {
+    {"raw",    ZCL_CMD_RAW_REST,    NULL},
+    {"quote",  ZCL_CMD_RAW_REST,    NULL},
+
+    {"join",   ZCL_CMD_JOIN,        "JOIN"},
+    {"j",      ZCL_CMD_JOIN,        "JOIN"},
+    {"part",   ZCL_CMD_PART,        "PART"},
+    {"leave",  ZCL_CMD_PART,        "PART"},
+    {"nick",   ZCL_CMD_SIMPLE_REST, "NICK"},
+    {"quit",   ZCL_CMD_SIMPLE_REST, "QUIT"},
+    {"disconnect", ZCL_CMD_SIMPLE_REST, "QUIT"},
+    {"away",   ZCL_CMD_AWAY,        "AWAY"},
+    {"topic",  ZCL_CMD_TOPIC,       "TOPIC"},
+    {"mode",   ZCL_CMD_MODE,        "MODE"},
+    {"kick",   ZCL_CMD_KICK,        "KICK"},
+    {"invite", ZCL_CMD_INVITE,      "INVITE"},
+
+    {"msg",    ZCL_CMD_MSG,         NULL},
+    {"m",      ZCL_CMD_MSG,         NULL},
+    {"notice", ZCL_CMD_NOTICE,      NULL},
+    {"me",     ZCL_CMD_ACTION,      NULL},
+    {"action", ZCL_CMD_ACTION,      NULL},
+
+    {"query",  ZCL_CMD_QUERY_UI,    NULL},
+    {"q",      ZCL_CMD_QUERY_UI,    NULL},
+    {"close",  ZCL_CMD_CLOSE_UI,    NULL},
+    {"say",    ZCL_CMD_SAY_UI,      NULL},
+
+    {"whois",  ZCL_CMD_WHOIS,       "WHOIS"},
+    {"names",  ZCL_CMD_NAMES,       "NAMES"},
+    {"who",    ZCL_CMD_WHO,         "WHO"},
+    {"list",   ZCL_CMD_LIST,        "LIST"},
+  };
+
+  const ZclCmdSpec *spec = NULL;
+  for (guint i = 0; i < G_N_ELEMENTS(table); i++) {
+    if (g_strcmp0(cmd, table[i].name) == 0) { spec = &table[i]; break; }
+  }
+
+  // Unknown: pass through as raw "CMD rest" (uppercased).
+  if (!spec) {
+    gchar *uc = g_ascii_strup(cmd, -1);
+    gchar *raw = (rest && *rest) ? g_strdup_printf("%s %s", uc, rest) : g_strdup(uc);
+    zcl_send_raw_line(st, page, raw);
+    g_free(raw);
+    g_free(uc);
+    g_free(tmp);
+    return;
+  }
+
+  // UI-only commands can run even while disconnected.
+  if (spec->rule == ZCL_CMD_QUERY_UI) {
+    gchar *r = rest;
+    gchar *nick = zcl_take_token(&r);
+    if (nick && *nick) zcl_ui_open_query(st, nick);
+    else chat_page_append(page, "Usage: /query <nick>");
+    g_free(tmp);
+    return;
+  }
+
+  if (spec->rule == ZCL_CMD_CLOSE_UI) {
+    if (st->notebook) {
+      GtkWidget *child = gtk_notebook_get_nth_page(GTK_NOTEBOOK(st->notebook),
+        gtk_notebook_get_current_page(GTK_NOTEBOOK(st->notebook)));
+      const gchar *cur = child ? zcl_target_for_child(st, child) : NULL;
+      if (cur && g_strcmp0(cur, "status") != 0) zcl_ui_close_target(st, cur, TRUE);
+    }
+    g_free(tmp);
+    return;
+  }
+
+  if (spec->rule == ZCL_CMD_SAY_UI) {
+    if (!rest || !*rest) { g_free(tmp); return; }
+    if (g_strcmp0(effective_target, "status") == 0) {
+      chat_page_append(page, "No target here. Switch to a channel/query tab.");
+      g_free(tmp);
+      return;
+    }
+    if (!st->client || !zc_client_is_connected(st->client)) {
+      chat_page_append(page, "Not connected.");
+      g_free(tmp);
+      return;
+    }
+    GError *err = NULL;
+    zc_client_privmsg(st->client, effective_target, rest, &err);
+    if (err) {
+      chat_page_append_fmt(page, "Send failed: %s", err->message);
+      g_clear_error(&err);
+    }
+    g_free(tmp);
+    return;
+  }
+
+  // Everything below this line requires an IRC connection.
+  if (!st->client || !zc_client_is_connected(st->client)) {
+    chat_page_append(page, "Not connected.");
+    g_free(tmp);
+    return;
+  }
+
+  switch (spec->rule) {
+
+    /* These are handled in the UI-only section above; keep them here to
+     * satisfy -Wswitch when new enum values are added. */
+    case ZCL_CMD_QUERY_UI:
+    case ZCL_CMD_CLOSE_UI:
+    case ZCL_CMD_SAY_UI:
+      return;
+
+    case ZCL_CMD_RAW_REST: {
+      if (rest && *rest) zcl_send_raw_line(st, page, rest);
+      break;
+    }
+
+    case ZCL_CMD_SIMPLE_REST: {
+      if (rest && *rest) {
+        gchar *raw = g_strdup_printf("%s %s", spec->irc_cmd, rest);
+        zcl_send_raw_line(st, page, raw);
+        g_free(raw);
+      } else {
+        zcl_send_raw_line(st, page, spec->irc_cmd);
+      }
+      break;
+    }
+
+    case ZCL_CMD_JOIN: {
+      if (!rest || !*rest) { chat_page_append(page, "Usage: /join <#channel>[,<#channel>]"); break; }
+      gchar *raw = g_strdup_printf("JOIN %s", rest);
+      zcl_send_raw_line(st, page, raw);
+      g_free(raw);
+      break;
+    }
+
+    case ZCL_CMD_PART: {
+      gchar *r = rest;
+      gchar *a = zcl_take_token(&r);
+      const gchar *chan = NULL;
+      const gchar *reason = NULL;
+
+      if (a && is_channel_name(a)) {
+        chan = a;
+        reason = (r && *r) ? r : NULL;
+      } else {
+        chan = effective_target;
+        reason = (a && *a) ? rest : NULL;
+      }
+
+      if (!chan || g_strcmp0(chan, "status") == 0) {
+        chat_page_append(page, "Usage: /part <#channel> [reason]");
+        break;
+      }
+
+      gchar *raw = NULL;
+      if (reason && *reason) raw = g_strdup_printf("PART %s :%s", chan, reason);
+      else raw = g_strdup_printf("PART %s", chan);
+
+      zcl_send_raw_line(st, page, raw);
+      g_free(raw);
+      break;
+    }
+
+    case ZCL_CMD_TOPIC: {
+      gchar *r = rest;
+      gchar *a = zcl_take_token(&r);
+      const gchar *chan = NULL;
+      const gchar *topic = NULL;
+
+      if (a && is_channel_name(a)) {
+        chan = a;
+        topic = (r && *r) ? r : NULL;
+      } else {
+        chan = effective_target;
+        topic = (rest && *rest) ? rest : NULL;
+      }
+
+      if (!chan || g_strcmp0(chan, "status") == 0) {
+        chat_page_append(page, "Usage: /topic <#channel> [topic]");
+        break;
+      }
+
+      gchar *raw = NULL;
+      if (topic && *topic) raw = g_strdup_printf("TOPIC %s :%s", chan, topic);
+      else raw = g_strdup_printf("TOPIC %s", chan);
+
+      zcl_send_raw_line(st, page, raw);
+      g_free(raw);
+      break;
+    }
+
+    case ZCL_CMD_WHOIS: {
+      gchar *r = rest;
+      gchar *nick = zcl_take_token(&r);
+      if (!nick || !*nick) { chat_page_append(page, "Usage: /whois <nick>"); break; }
+      gchar *raw = g_strdup_printf("WHOIS %s", nick);
+      gboolean ok = zcl_send_raw_line(st, page, raw);
+      if (ok) zcl_whois_begin(nick);
+      g_free(raw);
+      break;
+    }
+
+    case ZCL_CMD_NAMES: {
+      const gchar *chan = (rest && *rest) ? rest : effective_target;
+      if (!chan || g_strcmp0(chan, "status") == 0) { chat_page_append(page, "Usage: /names <#channel>"); break; }
+      gchar *raw = g_strdup_printf("NAMES %s", chan);
+      zcl_send_raw_line(st, page, raw);
+      g_free(raw);
+      break;
+    }
+
+    case ZCL_CMD_WHO: {
+      if (rest && *rest) {
+        gchar *raw = g_strdup_printf("WHO %s", rest);
+        zcl_send_raw_line(st, page, raw);
+        g_free(raw);
+      } else {
+        const gchar *chan = effective_target;
+        if (!chan || g_strcmp0(chan, "status") == 0) { chat_page_append(page, "Usage: /who <mask>"); break; }
+        gchar *raw = g_strdup_printf("WHO %s", chan);
+        zcl_send_raw_line(st, page, raw);
         g_free(raw);
       }
+      break;
     }
-  } else if (g_ascii_strcasecmp(cmd, "me") == 0) {
-    if (!zc_client_is_connected(st->client)) {
-      chat_page_append(page, "Not connected.");
-    } else if (*rest) {
-      gchar *ctcp = g_strdup_printf("\001ACTION %s\001", rest);
-      GError *error = NULL;
-      if (!zc_client_privmsg(st->client, effective_target, ctcp, &error)) {
-        chat_page_append_fmt(page, "ACTION failed: %s", error->message);
-        g_clear_error(&error);
+
+    case ZCL_CMD_LIST: {
+      if (rest && *rest) {
+        gchar *raw = g_strdup_printf("LIST %s", rest);
+        zcl_send_raw_line(st, page, raw);
+        g_free(raw);
       } else {
-        chat_page_append_fmt(page, "* %s %s", st->nick ? st->nick : "me", rest);
+        zcl_send_raw_line(st, page, "LIST");
       }
-      g_free(ctcp);
-    }
-  } else if (g_ascii_strcasecmp(cmd, "query") == 0) {
-    gchar **p2 = g_strsplit(rest, " ", 2);
-    const gchar *who = (p2 && p2[0]) ? p2[0] : "";
-    const gchar *msg = (p2 && p2[1]) ? p2[1] : "";
-
-    if (!who || !*who) {
-      chat_page_append(page, "Usage: /query <nick> [message]");
-    } else {
-      ChatPage *pp = get_or_create_page(st, who);
-      gtk_widget_grab_focus(GTK_WIDGET(chat_page_get_entry(pp)));
-
-      if (*msg) {
-        if (!zc_client_is_connected(st->client)) {
-          chat_page_append(pp, "Not connected.");
-        } else {
-          GError *error = NULL;
-          if (!zc_client_privmsg(st->client, who, msg, &error)) {
-            chat_page_append_fmt(pp, "MSG failed: %s", error->message);
-            g_clear_error(&error);
-          } else {
-            chat_page_append_fmt(pp, "<%s> %s", st->nick ? st->nick : "me", msg);
-          }
-        }
-      }
+      break;
     }
 
-    g_strfreev(p2);
-  } else if (g_ascii_strcasecmp(cmd, "msg") == 0) {
-    if (!zc_client_is_connected(st->client)) {
-      chat_page_append(page, "Not connected.");
-    } else {
-      gchar **p2 = g_strsplit(rest, " ", 2);
-      const gchar *to = p2[0] ? p2[0] : "";
-      const gchar *msg = p2[1] ? p2[1] : "";
-      if (*to && *msg) {
-        GError *error = NULL;
-        if (!zc_client_privmsg(st->client, to, msg, &error)) {
-          chat_page_append_fmt(page, "MSG failed: %s", error->message);
-          g_clear_error(&error);
-        } else {
-          ChatPage *pp = get_or_create_page(st, to);
-          chat_page_append_fmt(pp, "<%s> %s", st->nick ? st->nick : "me", msg);
-        }
-      }
-      g_strfreev(p2);
+    case ZCL_CMD_MODE: {
+      if (!rest || !*rest) { chat_page_append(page, "Usage: /mode <target> [modes]"); break; }
+      gchar *raw = g_strdup_printf("MODE %s", rest);
+      zcl_send_raw_line(st, page, raw);
+      g_free(raw);
+      break;
     }
-  } else if (g_ascii_strcasecmp(cmd, "raw") == 0) {
-    if (!zc_client_is_connected(st->client)) {
-      chat_page_append(page, "Not connected.");
-    } else if (*rest) {
-      GError *error = NULL;
-      if (!zc_client_send_raw(st->client, rest, &error)) {
-        chat_page_append_fmt(page, "RAW failed: %s", error->message);
-        g_clear_error(&error);
+
+    case ZCL_CMD_KICK: {
+      gchar *r = rest;
+      gchar *a = zcl_take_token(&r);
+      gchar *b = zcl_take_token(&r);
+
+      const gchar *chan = NULL;
+      const gchar *nick = NULL;
+      const gchar *reason = (r && *r) ? r : NULL;
+
+      if (a && is_channel_name(a)) { chan = a; nick = b; }
+      else {
+        chan = effective_target;
+        nick = a;
+        if (b && *b) reason = b;
+        if (r && *r) reason = r;
+      }
+
+      if (!chan || g_strcmp0(chan, "status") == 0 || !nick || !*nick) {
+        chat_page_append(page, "Usage: /kick [#channel] <nick> [reason]");
+        break;
+      }
+
+      gchar *raw = NULL;
+      if (reason && *reason) raw = g_strdup_printf("KICK %s %s :%s", chan, nick, reason);
+      else raw = g_strdup_printf("KICK %s %s", chan, nick);
+
+      zcl_send_raw_line(st, page, raw);
+      g_free(raw);
+      break;
+    }
+
+    case ZCL_CMD_INVITE: {
+      gchar *r = rest;
+      gchar *nick = zcl_take_token(&r);
+      const gchar *chan = (r && *r) ? r : effective_target;
+
+      if (!nick || !*nick || !chan || g_strcmp0(chan, "status") == 0) {
+        chat_page_append(page, "Usage: /invite <nick> [#channel]");
+        break;
+      }
+
+      gchar *raw = g_strdup_printf("INVITE %s %s", nick, chan);
+      zcl_send_raw_line(st, page, raw);
+      g_free(raw);
+      break;
+    }
+
+    case ZCL_CMD_AWAY: {
+      if (rest && *rest) {
+        gchar *raw = g_strdup_printf("AWAY :%s", rest);
+        zcl_send_raw_line(st, page, raw);
+        g_free(raw);
       } else {
-        chat_page_append_fmt(page, "→ %s", rest);
+        zcl_send_raw_line(st, page, "AWAY");
       }
+      break;
     }
-  } else if (g_ascii_strcasecmp(cmd, "quit") == 0) {
-    if (zc_client_is_connected(st->client)) {
-      GError *error = NULL;
-      (void)zc_client_quit(st->client, *rest ? rest : NULL, &error);
-      if (error) g_clear_error(&error);
-    }
-    zc_client_disconnect(st->client);
-  } else if (g_strcmp0(cmd, "query") == 0) {
-  // /query <nick> [message...]  (opens DM tab, optionally sends message)
-  gchar **parts = g_strsplit(rest, " ", 2);
-  const gchar *nick = parts[0] ? g_strstrip(parts[0]) : "";
-  if (nick[0]) {
-    zcl_ui_open_query(st, nick);
-    if (parts[1] && parts[1][0] && st->client && zc_client_is_connected(st->client)) {
-      gchar *line = g_strdup_printf("PRIVMSG %s :%s", nick, parts[1]);
-      zc_client_send_raw(st->client, line, NULL);
-      g_free(line);
-    }
-  } else {
-    chat_page_append_fmt(page, "Usage: /query <nick> [message]");
-  }
-  g_strfreev(parts);
-} else if (g_strcmp0(cmd, "whois") == 0) {
-  gchar *nick = g_strdup(rest);
-  g_strstrip(nick);
-  ChatPage *status = get_or_create_page(st, "status");
-  if (!nick[0]) {
-    chat_page_append_fmt(page, "Usage: /whois <nick>");
-  } else if (!st->client || !zc_client_is_connected(st->client)) {
-    chat_page_append_fmt(status, "Not connected.");
-  } else {
-    gchar *line = g_strdup_printf("WHOIS %s", nick);
-    zc_client_send_raw(st->client, line, NULL);
-    g_free(line);
-    chat_page_append_fmt(status, "→ WHOIS %s", nick);
-  }
-} else if (g_strcmp0(cmd, "close") == 0) {
-  // /close [target]  (closes current tab if no target)
-  gchar *t = g_strdup(rest);
-  g_strstrip(t);
-  if (!t[0]) {
-    GtkNotebook *nb = GTK_NOTEBOOK(st->notebook);
-    GtkWidget *child = gtk_notebook_get_nth_page(nb, gtk_notebook_get_current_page(nb));
-    const gchar *cur = zcl_target_for_child(st, child);
-    if (cur && g_strcmp0(cur, "status") != 0) zcl_ui_close_target(st, cur, TRUE);
-  g_free(t);
-  } else {
-    zcl_ui_close_target(st, t, TRUE);
-  }
-} else {
-  chat_page_append_fmt(page, "Unknown command: /%s", cmd);
-}
 
-  g_strfreev(parts);
+    case ZCL_CMD_MSG:
+    case ZCL_CMD_NOTICE: {
+      gchar *r = rest;
+      gchar *nick = zcl_take_token(&r);
+      const gchar *msg = (r && *r) ? r : NULL;
+
+      if (!nick || !*nick || !msg || !*msg) {
+        chat_page_append(page, spec->rule == ZCL_CMD_NOTICE ? "Usage: /notice <nick> <text>" : "Usage: /msg <nick> <text>");
+        break;
+      }
+
+      // Open a query tab for convenience when messaging someone directly.
+      zcl_ui_open_query(st, nick);
+
+      gchar *raw = NULL;
+      if (spec->rule == ZCL_CMD_NOTICE) raw = g_strdup_printf("NOTICE %s :%s", nick, msg);
+      else raw = g_strdup_printf("PRIVMSG %s :%s", nick, msg);
+
+      zcl_send_raw_line(st, page, raw);
+      g_free(raw);
+      break;
+    }
+
+    case ZCL_CMD_ACTION: {
+      if (!rest || !*rest) { chat_page_append(page, "Usage: /me <action>"); break; }
+      if (g_strcmp0(effective_target, "status") == 0) { chat_page_append(page, "No target here. Switch to a channel/query tab."); break; }
+
+      gchar *raw = g_strdup_printf("PRIVMSG %s :\001ACTION %s\001", effective_target, rest);
+      zcl_send_raw_line(st, page, raw);
+      g_free(raw);
+      break;
+    }
+  }
+
+  g_free(tmp);
 }
 
 static void
@@ -1239,12 +2022,12 @@ userlist_popup_menu(UiState *st, const gchar *nick, GdkEventButton *ev) {
 
   GtkWidget *mi_dm = gtk_menu_item_new_with_label("Send DM");
   g_object_set_data_full(G_OBJECT(mi_dm), "zc-nick", g_strdup(nick), g_free);
-  g_signal_connect(mi_dm, "activate", G_CALLBACK(zcl_userlist_menu_send_dm), st);
+  g_signal_connect(mi_dm, "activate", G_CALLBACK(on_userlist_menu_send_dm), st);
   gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_dm);
 
   GtkWidget *mi_whois = gtk_menu_item_new_with_label("WHOIS");
   g_object_set_data_full(G_OBJECT(mi_whois), "zc-nick", g_strdup(nick), g_free);
-  g_signal_connect(mi_whois, "activate", G_CALLBACK(zcl_userlist_menu_whois), st);
+  g_signal_connect(mi_whois, "activate", G_CALLBACK(on_userlist_menu_whois), st);
   gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_whois);
 
   GtkWidget *sep = gtk_separator_menu_item_new();
@@ -1252,7 +2035,7 @@ userlist_popup_menu(UiState *st, const gchar *nick, GdkEventButton *ev) {
 
   GtkWidget *mi_copy = gtk_menu_item_new_with_label("Copy Nick");
   g_object_set_data_full(G_OBJECT(mi_copy), "zc-nick", g_strdup(nick), g_free);
-  g_signal_connect(mi_copy, "activate", G_CALLBACK(zcl_userlist_menu_copy), st);
+  g_signal_connect(mi_copy, "activate", G_CALLBACK(on_userlist_menu_copy), st);
   gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_copy);
 
   gtk_widget_show_all(menu);
@@ -1305,28 +2088,74 @@ zcl_userlist_button_press(GtkWidget *w, GdkEventButton *ev, gpointer user_data) 
 static void
 on_userlist_menu_send_dm(GtkMenuItem *mi, gpointer user_data)
 {
-  /* Old handler name kept as a wrapper for compatibility. */
-  zcl_userlist_menu_send_dm(mi, user_data);
-}
+  UiState *st = user_data;
+  if (!st) return;
 
+  const gchar *nick = g_object_get_data(G_OBJECT(mi), "zc-nick");
+  if (!nick || !*nick) return;
+
+  while (*nick && strchr("@+%&~", *nick)) nick++;
+  if (!*nick) return;
+
+  zcl_ui_open_query(st, nick);
+}
 
 
 static void
 on_userlist_menu_whois(GtkMenuItem *mi, gpointer user_data)
 {
-  /* Old handler name kept as a wrapper for compatibility. */
-  zcl_userlist_menu_whois(mi, user_data);
-}
+  UiState *st = user_data;
+  if (!st || !st->client) return;
 
+  const gchar *nick = g_object_get_data(G_OBJECT(mi), "zc-nick");
+  if (!nick || !*nick) return;
+
+  /* Userlist rows can carry a mode prefix in the displayed text. WHOIS needs the bare nick. */
+  while (*nick && strchr("@+%&~", *nick)) nick++;
+  if (!*nick) return;
+
+  ChatPage *status = get_or_create_page(st, "status");
+
+  if (!zc_client_is_connected(st->client)) {
+    chat_page_append_fmt(status, "Not connected.");
+    return;
+  }
+
+  zcl_whois_begin(nick);
+
+  gchar *line = g_strdup_printf("WHOIS %s", nick);
+  GError *error = NULL;
+  if (!zc_client_send_raw(st->client, line, &error)) {
+    zcl_whois_clear();
+    chat_page_append_fmt(status, "WHOIS failed: %s", error ? error->message : "unknown error");
+    if (error) g_error_free(error);
+    g_free(line);
+    return;
+  }
+
+  chat_page_append_fmt(status, "→ WHOIS %s", nick);
+  g_free(line);
+}
 
 
 static void
 on_userlist_menu_copy(GtkMenuItem *mi, gpointer user_data)
 {
-  /* Old handler name kept as a wrapper for compatibility. */
-  zcl_userlist_menu_copy(mi, user_data);
-}
+  UiState *st = user_data;
+  if (!st) return;
 
+  const gchar *nick = g_object_get_data(G_OBJECT(mi), "zc-nick");
+  if (!nick || !*nick) return;
+
+  while (*nick && strchr("@+%&~", *nick)) nick++;
+  if (!*nick) return;
+
+  GtkClipboard *cb = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+  gtk_clipboard_set_text(cb, nick, -1);
+
+  ChatPage *status = get_or_create_page(st, "status");
+  chat_page_append_fmt(status, "Copied: %s", nick);
+}
 
 
 
@@ -1347,9 +2176,8 @@ zcl_page_for_child(UiState *st, GtkWidget *child) {
 
 static const gchar *
 zcl_target_for_child(UiState *st, GtkWidget *child) {
-  const gchar *t = g_object_get_data(G_OBJECT(child), "zcl-target");
-  if (t && t[0]) return t;
-
+  const gchar *direct = g_object_get_data(G_OBJECT(child), "zcl-target");
+  if (direct && *direct) return direct;
   ChatPage *p = zcl_page_for_child(st, child);
   return p ? chat_page_get_target(p) : NULL;
 }
@@ -1360,8 +2188,7 @@ zcl_notebook_apply_close_button(UiState *st, GtkWidget *child) {
   GtkNotebook *nb = GTK_NOTEBOOK(st->notebook);
 
   const gchar *target = zcl_target_for_child(st, child);
-  if (!target || !target[0] || g_strcmp0(target, "status") == 0) return;
-// don't close status
+  if (!target || g_strcmp0(target, "status") == 0) return; // don't close status
 
   GtkWidget *existing = gtk_notebook_get_tab_label(nb, child);
   if (existing && g_object_get_data(G_OBJECT(existing), "zcl-tab") != NULL) return;
@@ -1377,11 +2204,9 @@ zcl_notebook_apply_close_button(UiState *st, GtkWidget *child) {
 
   GtkWidget *lbl = gtk_label_new(label_text);
   gtk_label_set_ellipsize(GTK_LABEL(lbl), PANGO_ELLIPSIZE_END);
+  gtk_label_set_width_chars(GTK_LABEL(lbl), 12);
   gtk_widget_set_halign(lbl, GTK_ALIGN_START);
 
-  gtk_widget_set_hexpand(lbl, TRUE);
-  gtk_label_set_width_chars(GTK_LABEL(lbl), 12);
-  gtk_label_set_max_width_chars(GTK_LABEL(lbl), 24);
   GtkWidget *btn = gtk_button_new_from_icon_name("window-close-symbolic", GTK_ICON_SIZE_MENU);
   if (!btn) btn = gtk_button_new_with_label("×");
   gtk_button_set_relief(GTK_BUTTON(btn), GTK_RELIEF_NONE);
@@ -1450,74 +2275,6 @@ zcl_userlist_normalize_nick(const gchar *s) {
   return g_strdup(s);
 }
 
-static gchar *
-zcl_userlist_get_nick_at_path(GtkTreeView *tv, GtkTreePath *path) {
-  if (!tv || !path) return NULL;
-  GtkTreeModel *model = gtk_tree_view_get_model(tv);
-  if (!model) return NULL;
-
-  GtkTreeIter iter;
-  if (!gtk_tree_model_get_iter(model, &iter, path)) return NULL;
-
-  gchar *s0 = NULL;
-  gtk_tree_model_get(model, &iter, 0, &s0, -1);
-  if (s0 && *s0) {
-    gchar *n = zcl_userlist_normalize_nick(s0);
-    g_free(s0);
-    return n;
-  }
-  g_free(s0);
-
-  gchar *s1 = NULL;
-  gtk_tree_model_get(model, &iter, 1, &s1, -1);
-  if (s1 && *s1) {
-    gchar *n = zcl_userlist_normalize_nick(s1);
-    g_free(s1);
-    return n;
-  }
-  g_free(s1);
-  return NULL;
-}
-
-static void
-zcl_userlist_menu_send_dm(GtkMenuItem *mi, gpointer user_data) {
-  UiState *st = (UiState *)user_data;
-  const gchar *nick = (const gchar *)g_object_get_data(G_OBJECT(mi), "zcl-nick");
-  if (nick && *nick) zcl_ui_open_query(st, nick);
-}
-
-static void
-zcl_userlist_menu_whois(GtkMenuItem *mi, gpointer user_data) {
-  UiState *st = (UiState *)user_data;
-  const gchar *nick = (const gchar *)g_object_get_data(G_OBJECT(mi), "zcl-nick");
-  if (!nick || !*nick) return;
-
-  ChatPage *status = get_or_create_page(st, "status");
-  if (!st->client || !zc_client_is_connected(st->client)) {
-    chat_page_append_fmt(status, "Not connected.");
-    return;
-  }
-
-  gchar *line = g_strdup_printf("WHOIS %s", nick);
-  zc_client_send_raw(st->client, line, NULL);
-  g_free(line);
-  chat_page_append_fmt(status, "→ WHOIS %s", nick);
-}
-
-static void
-zcl_userlist_menu_copy(GtkMenuItem *mi, gpointer user_data) {
-  (void)user_data;
-  const gchar *nick = (const gchar *)g_object_get_data(G_OBJECT(mi), "zcl-nick");
-  if (!nick || !*nick) return;
-
-  GtkClipboard *cb = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
-  gtk_clipboard_set_text(cb, nick, -1);
-}
-
-
-
-
-GtkWidget *
 zc_ui_create_main_window(GtkApplication *app) {
   apply_css();
 
@@ -1615,7 +2372,8 @@ set_status(st, zc_client_is_connected(st->client) ? "Connected" : "Disconnected"
   /* connect to backend signals */
   g_signal_connect(st->client, "connected", G_CALLBACK(on_client_connected), st);
   g_signal_connect(st->client, "disconnected", G_CALLBACK(on_client_disconnected), st);
-  g_signal_connect(st->client, "raw-line", G_CALLBACK(on_client_raw_line), st);
+  /* Raw protocol spam makes /WHOIS (and everything else) unreadable. Keep it off. */
+  /* g_signal_connect(st->client, "raw-line", G_CALLBACK(on_client_raw_line), st); */
   g_signal_connect(st->client, "irc-message", G_CALLBACK(on_client_irc_message), st);
 
   g_object_set_data_full(G_OBJECT(st->win), "zc-state", st, (GDestroyNotify)ui_state_free);
@@ -1623,3 +2381,4 @@ set_status(st, zc_client_is_connected(st->client) ? "Connected" : "Disconnected"
   gtk_widget_show_all(st->win);
   return st->win;
 }
+

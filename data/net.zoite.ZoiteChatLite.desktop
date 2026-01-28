@@ -2,7 +2,7 @@
 Type=Application
 Name=ZoiteChat Lite
 Comment=Minimal GTK3 IRC client using LibZoiteChat
-Exec=~/.local/bin/zoitechat-lite
+Exec=LD_LIBRARY_PATH="$HOME/.local/lib:$HOME/.local/lib64:$LD_LIBRARY_PATH" ~/.local/bin/zoitechat-lite
 Icon=net.zoite.ZoiteChatLite
 Terminal=false
 Categories=Network;Chat;IRCClient;
