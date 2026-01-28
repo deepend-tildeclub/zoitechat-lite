@@ -1,0 +1,50 @@
+/* Minimal "ZoiteChat-ish" dark styling. GTK3 CSS is not modern web CSS. Shocking, I know. */
+
+window {
+  background-color: #0b1020;
+}
+
+headerbar {
+  background: #0f1630;
+  color: #e7ecff;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+headerbar button {
+  border-radius: 10px;
+}
+
+.zc-sidebar {
+  background-color: #0f1630;
+  border-right: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.zc-chatview textview {
+  background-color: #0b1020;
+  color: #e7ecff;
+}
+
+.zc-entry entry {
+  border-radius: 12px;
+  padding: 8px 10px;
+}
+
+.zc-muted {
+  color: rgba(231, 236, 255, 0.7);
+}
+
+.zc-accent {
+  color: #6ec5ff;
+}
+
+
+.zc-userlist {
+  background-color: #0f1630;
+  border-left: 1px solid rgba(255, 255, 255, 0.06);
+  padding: 6px;
+}
+
+.zc-userlist treeview {
+  background-color: #0f1630;
+  color: #e7ecff;
+}
