@@ -41,6 +41,10 @@ typedef struct {
 
   /* persisted settings */
   ZcSettings *settings;
+
+  /* last known normal window size (avoid saving 1x1 during teardown) */
+  gint last_win_w;
+  gint last_win_h;
 } UiState;
 
 
@@ -59,6 +63,11 @@ static ChatPage *zcl_page_for_child(UiState *st, GtkWidget *child);
 static void zcl_userlist_row_activated(GtkTreeView *tv, GtkTreePath *path, GtkTreeViewColumn *col, gpointer user_data);
 static gboolean zcl_userlist_button_press(GtkWidget *w, GdkEventButton *ev, gpointer user_data);
 static gchar *zcl_userlist_normalize_nick(const gchar *s);
+
+static gboolean on_window_configure(GtkWidget *w, GdkEventConfigure *ev, gpointer user_data);
+static gboolean on_window_delete(GtkWidget *w, GdkEvent *ev, gpointer user_data);
+static void zcl_window_store_size_if_reasonable(UiState *st, GtkWindow *win, gint w, gint h);
+static void zcl_settings_sync_and_save(UiState *st);
 
 static void on_userlist_menu_send_dm(GtkMenuItem *mi, gpointer user_data);
 static void on_userlist_menu_whois(GtkMenuItem *mi, gpointer user_data);
@@ -593,8 +602,7 @@ zcl_format_duration(guint secs) {
   return g_strdup_printf("%us", s);
 }
 
-static gchar *
-zcl_wrap_words(const gchar *s, gint width, const gchar *indent) {
+static G_GNUC_UNUSED gchar *zcl_wrap_words(const gchar *s, gint width, const gchar *indent) {
   if (!s || !*s) return g_strdup("");
   if (width < 10) width = 78;
   if (!indent) indent = "";
@@ -865,6 +873,33 @@ append_to_target(UiState *st, const gchar *target, const gchar *line) {
   chat_page_append(page, line);
 }
 
+static const gchar *
+ui_self_nick(UiState *st) {
+  if (!st) return "me";
+  if (st->client) {
+    const gchar *n = zc_client_get_nick(st->client);
+    if (n && *n) return n;
+  }
+  if (st->nick && *st->nick) return st->nick;
+  return "me";
+}
+
+static void
+ui_echo_outgoing_privmsg(UiState *st, const gchar *target, const gchar *text) {
+  if (!st || !target || !*target || !text) return;
+  gchar *line = g_strdup_printf("<%s> %s", ui_self_nick(st), text);
+  append_to_target(st, target, line);
+  g_free(line);
+}
+
+static void
+ui_echo_outgoing_action(UiState *st, const gchar *target, const gchar *action_text) {
+  if (!st || !target || !*target || !action_text) return;
+  gchar *line = g_strdup_printf("* %s %s", ui_self_nick(st), action_text);
+  append_to_target(st, target, line);
+  g_free(line);
+}
+
 static gboolean
 is_ctcp_action(const gchar *text) {
   if (!text) return FALSE;
@@ -953,6 +988,19 @@ on_client_irc_message(ZcClient *client, ZcIrcMessage *msg, UiState *st) {
     if (oldn && newn && *newn) {
       user_rename_everywhere(st, oldn, newn);
       userlist_refresh_all(st);
+
+      /* If this NICK change is ours, keep the UI/client identity in sync.
+       * Some servers don't echo your own PRIVMSG, so we locally echo. That
+       * means our idea of "self nick" must stay accurate.
+       */
+      const gchar *selfn = NULL;
+      if (st && st->client) selfn = zc_client_get_nick(st->client);
+      if (!selfn || !*selfn) selfn = st ? st->nick : NULL;
+      if (selfn && *selfn && g_ascii_strcasecmp(oldn, selfn) == 0) {
+        g_free(st->nick);
+        st->nick = g_strdup(newn);
+        if (st->client) zc_client_set_identity(st->client, st->nick, st->user, st->realname);
+      }
     }
     g_free(oldn);
   }
@@ -1290,8 +1338,8 @@ if (!wnick) wnick = zc_irc_message_param(msg, 0);
   }
 }
 
-static void
-on_client_raw_line(ZcClient *client, gchar *line, UiState *st) {
+static G_GNUC_UNUSED void
+on_client_raw_line(ZcClient *client, const gchar *line, UiState *st) {
   (void)client;
   if (!line) return;
   append_server_line(st, line);
@@ -1384,11 +1432,16 @@ run_command(UiState *st, const gchar *target, const gchar *line) {
       return;
     }
 
+
 	    GError *err = NULL;
-	    zc_client_privmsg(st->client, effective_target, msg, &err);
-    if (err) {
-      chat_page_append_fmt(page, "Send failed: %s", err->message);
+	    gboolean ok = zc_client_privmsg(st->client, effective_target, msg, &err);
+    if (!ok || err) {
+      chat_page_append_fmt(page, "Send failed: %s", err ? err->message : "unknown error");
       g_clear_error(&err);
+    } else {
+      // Many IRCds do not echo your own PRIVMSG back to you.
+      // If we don't locally echo, your message "vanishes" from your own buffer.
+      ui_echo_outgoing_privmsg(st, effective_target, msg);
     }
     return;
   }
@@ -1406,10 +1459,12 @@ run_command(UiState *st, const gchar *target, const gchar *line) {
     }
 
 	    GError *err = NULL;
-	    zc_client_privmsg(st->client, effective_target, line, &err);
-    if (err) {
-      chat_page_append_fmt(page, "Send failed: %s", err->message);
+	    gboolean ok = zc_client_privmsg(st->client, effective_target, line, &err);
+    if (!ok || err) {
+      chat_page_append_fmt(page, "Send failed: %s", err ? err->message : "unknown error");
       g_clear_error(&err);
+    } else {
+      ui_echo_outgoing_privmsg(st, effective_target, line);
     }
     return;
   }
@@ -1543,10 +1598,12 @@ run_command(UiState *st, const gchar *target, const gchar *line) {
       return;
     }
     GError *err = NULL;
-    zc_client_privmsg(st->client, effective_target, rest, &err);
-    if (err) {
-      chat_page_append_fmt(page, "Send failed: %s", err->message);
+    gboolean ok = zc_client_privmsg(st->client, effective_target, rest, &err);
+    if (!ok || err) {
+      chat_page_append_fmt(page, "Send failed: %s", err ? err->message : "unknown error");
       g_clear_error(&err);
+    } else {
+      ui_echo_outgoing_privmsg(st, effective_target, rest);
     }
     g_free(tmp);
     return;
@@ -1778,7 +1835,10 @@ run_command(UiState *st, const gchar *target, const gchar *line) {
       if (spec->rule == ZCL_CMD_NOTICE) raw = g_strdup_printf("NOTICE %s :%s", nick, msg);
       else raw = g_strdup_printf("PRIVMSG %s :%s", nick, msg);
 
-      zcl_send_raw_line(st, page, raw);
+      gboolean ok = zcl_send_raw_line(st, page, raw);
+      if (ok && spec->rule == ZCL_CMD_MSG) {
+        ui_echo_outgoing_privmsg(st, nick, msg);
+      }
       g_free(raw);
       break;
     }
@@ -1788,7 +1848,8 @@ run_command(UiState *st, const gchar *target, const gchar *line) {
       if (g_strcmp0(effective_target, "status") == 0) { chat_page_append(page, "No target here. Switch to a channel/query tab."); break; }
 
       gchar *raw = g_strdup_printf("PRIVMSG %s :\001ACTION %s\001", effective_target, rest);
-      zcl_send_raw_line(st, page, raw);
+      gboolean ok = zcl_send_raw_line(st, page, raw);
+      if (ok) ui_echo_outgoing_action(st, effective_target, rest);
       g_free(raw);
       break;
     }
@@ -1946,6 +2007,64 @@ on_page_added(GtkNotebook *nb, GtkWidget *child, guint page_num, gpointer user_d
   g_list_free(kids);
 }
 
+
+static void
+zcl_window_store_size_if_reasonable(UiState *st, GtkWindow *win, gint w, gint h) {
+  if (!st) return;
+  /* Ignore bogus sizes (can happen during early realize or teardown). */
+  if (w < 320 || h < 240) return;
+  /* Only store the "normal" size. If the window is maximized, keep the last normal size. */
+  if (win && gtk_window_is_maximized(win)) return;
+  st->last_win_w = w;
+  st->last_win_h = h;
+}
+
+static gboolean
+on_window_configure(GtkWidget *w, GdkEventConfigure *ev, gpointer user_data) {
+  UiState *st = (UiState *)user_data;
+  if (!st || !GTK_IS_WINDOW(w) || !ev) return FALSE;
+  zcl_window_store_size_if_reasonable(st, GTK_WINDOW(w), ev->width, ev->height);
+  return FALSE;
+}
+
+static void
+zcl_settings_sync_and_save(UiState *st) {
+  if (!st || !st->settings) return;
+
+  /* Clamp: never persist microscopic sizes. */
+  if (st->last_win_w < 320) st->last_win_w = 980;
+  if (st->last_win_h < 240) st->last_win_h = 640;
+
+  st->settings->win_w = st->last_win_w;
+  st->settings->win_h = st->last_win_h;
+
+  g_free(st->settings->host); st->settings->host = g_strdup(st->host ? st->host : "");
+  st->settings->port = st->port;
+  st->settings->tls = st->tls;
+  g_free(st->settings->nick); st->settings->nick = g_strdup(st->nick ? st->nick : "");
+  g_free(st->settings->user); st->settings->user = g_strdup(st->user ? st->user : "");
+  g_free(st->settings->realname); st->settings->realname = g_strdup(st->realname ? st->realname : "");
+  g_free(st->settings->auto_join); st->settings->auto_join = g_strdup(st->auto_join ? st->auto_join : "");
+
+  GError *se = NULL;
+  (void)zc_settings_save(st->settings, &se);
+  if (se) g_clear_error(&se);
+}
+
+static gboolean
+on_window_delete(GtkWidget *w, GdkEvent *ev, gpointer user_data) {
+  (void)ev;
+  UiState *st = (UiState *)user_data;
+  if (st && w && GTK_IS_WINDOW(w)) {
+    gint ww = 0, hh = 0;
+    gtk_window_get_size(GTK_WINDOW(w), &ww, &hh);
+    zcl_window_store_size_if_reasonable(st, GTK_WINDOW(w), ww, hh);
+  }
+  zcl_settings_sync_and_save(st);
+  /* Returning FALSE keeps default destroy behavior. */
+  return FALSE;
+}
+
 static void
 ui_state_free(UiState *st) {
   if (!st) return;
@@ -1958,22 +2077,7 @@ ui_state_free(UiState *st) {
     zc_client_disconnect(st->client);
   }
 
-  if (st->settings && st->win && GTK_IS_WINDOW(st->win)) {
-    gint w = 0, h = 0;
-    if (st->win && GTK_IS_WINDOW(st->win) && !gtk_widget_in_destruction(GTK_WIDGET(st->win))) w = gtk_widget_get_allocated_width(GTK_WIDGET(st->win)), h = gtk_widget_get_allocated_height(GTK_WIDGET(st->win));
-    st->settings->win_w = w;
-    st->settings->win_h = h;
-    g_free(st->settings->host); st->settings->host = g_strdup(st->host ? st->host : "");
-    st->settings->port = st->port;
-    st->settings->tls = st->tls;
-    g_free(st->settings->nick); st->settings->nick = g_strdup(st->nick ? st->nick : "");
-    g_free(st->settings->user); st->settings->user = g_strdup(st->user ? st->user : "");
-    g_free(st->settings->realname); st->settings->realname = g_strdup(st->realname ? st->realname : "");
-    g_free(st->settings->auto_join); st->settings->auto_join = g_strdup(st->auto_join ? st->auto_join : "");
-    GError *se = NULL;
-    (void)zc_settings_save(st->settings, &se);
-    if (se) g_clear_error(&se);
-  }
+  zcl_settings_sync_and_save(st);
 
   g_free(st->host);
   g_free(st->nick);
@@ -2282,7 +2386,7 @@ zcl_ui_open_query(UiState *st, const gchar *nick) {
   if (entry) gtk_widget_grab_focus(entry);
 }
 
-static gchar *
+static G_GNUC_UNUSED gchar *
 zcl_userlist_normalize_nick(const gchar *s) {
   if (!s) return NULL;
   while (*s == ' ' || *s == '\t') s++;
@@ -2306,6 +2410,14 @@ GtkWidget *zc_ui_create_main_window(GtkApplication *app) {
   st->user = g_strdup(st->settings->user);
   st->realname = g_strdup(st->settings->realname);
   st->auto_join = g_strdup(st->settings->auto_join);
+
+  /* Window size persistence: start from the last saved normal size, but ignore bogus tiny values. */
+  st->last_win_w = st->settings->win_w;
+  st->last_win_h = st->settings->win_h;
+  if (st->last_win_w < 320) st->last_win_w = 980;
+  if (st->last_win_h < 240) st->last_win_h = 640;
+  st->settings->win_w = st->last_win_w;
+  st->settings->win_h = st->last_win_h;
 
 
   st->pages = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
@@ -2334,9 +2446,13 @@ if (g_file_test("data/icons/hicolor/scalable/apps/net.zoite.ZoiteChatLite.svg", 
     g_clear_error(&e);
   }
 }
-  gtk_window_set_default_size(GTK_WINDOW(st->win), st->settings ? st->settings->win_w : 980, st->settings ? st->settings->win_h : 640);
+  gtk_window_set_default_size(GTK_WINDOW(st->win), st->last_win_w, st->last_win_h);
   gtk_window_set_title(GTK_WINDOW(st->win), "ZoiteChat Lite");
   gtk_window_set_position(GTK_WINDOW(st->win), GTK_WIN_POS_CENTER);
+  /* Track window size while running so we don't save 1x1 at teardown. */
+  g_signal_connect(st->win, "configure-event", G_CALLBACK(on_window_configure), st);
+  g_signal_connect(st->win, "delete-event", G_CALLBACK(on_window_delete), st);
+
 
   GtkWidget *hb = gtk_header_bar_new();
   gtk_header_bar_set_show_close_button(GTK_HEADER_BAR(hb), TRUE);
