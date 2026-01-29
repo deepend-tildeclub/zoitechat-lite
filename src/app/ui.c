@@ -1940,7 +1940,7 @@ ui_state_free(UiState *st) {
 
   if (st->settings && st->win && GTK_IS_WINDOW(st->win)) {
     gint w = 0, h = 0;
-    gtk_window_get_size(GTK_WINDOW(st->win), &w, &h);
+    if (st->win && GTK_IS_WINDOW(st->win) && !gtk_widget_in_destruction(GTK_WIDGET(st->win))) w = gtk_widget_get_allocated_width(GTK_WIDGET(st->win)), h = gtk_widget_get_allocated_height(GTK_WIDGET(st->win));
     st->settings->win_w = w;
     st->settings->win_h = h;
     g_free(st->settings->host); st->settings->host = g_strdup(st->host ? st->host : "");
@@ -2040,7 +2040,7 @@ userlist_popup_menu(UiState *st, const gchar *nick, GdkEventButton *ev) {
 
   gtk_widget_show_all(menu);
 
-  g_signal_connect_swapped(menu, "deactivate", G_CALLBACK(gtk_widget_destroy), menu);
+  g_signal_connect_swapped(menu, "selection-done", G_CALLBACK(gtk_widget_destroy), menu);
 
 #if GTK_CHECK_VERSION(3,22,0)
   gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)ev);
@@ -2092,6 +2092,7 @@ on_userlist_menu_send_dm(GtkMenuItem *mi, gpointer user_data)
   if (!st) return;
 
   const gchar *nick = g_object_get_data(G_OBJECT(mi), "zc-nick");
+  if (!nick) nick = g_object_get_data(G_OBJECT(mi), "zc-nick");
   if (!nick || !*nick) return;
 
   while (*nick && strchr("@+%&~", *nick)) nick++;
@@ -2102,38 +2103,16 @@ on_userlist_menu_send_dm(GtkMenuItem *mi, gpointer user_data)
 
 
 static void
-on_userlist_menu_whois(GtkMenuItem *mi, gpointer user_data)
-{
+on_userlist_menu_whois(GtkMenuItem *mi, gpointer user_data) {
   UiState *st = user_data;
-  if (!st || !st->client) return;
-
   const gchar *nick = g_object_get_data(G_OBJECT(mi), "zc-nick");
-  if (!nick || !*nick) return;
+  if (!st || !nick || !*nick) return;
 
-  /* Userlist rows can carry a mode prefix in the displayed text. WHOIS needs the bare nick. */
-  while (*nick && strchr("@+%&~", *nick)) nick++;
-  if (!*nick) return;
+  const gchar *target = current_target(st);
+  if (!target || !*target) target = "status";
 
-  ChatPage *status = get_or_create_page(st, "status");
-
-  if (!zc_client_is_connected(st->client)) {
-    chat_page_append_fmt(status, "Not connected.");
-    return;
-  }
-
-  zcl_whois_begin(nick);
-
-  gchar *line = g_strdup_printf("WHOIS %s", nick);
-  GError *error = NULL;
-  if (!zc_client_send_raw(st->client, line, &error)) {
-    zcl_whois_clear();
-    chat_page_append_fmt(status, "WHOIS failed: %s", error ? error->message : "unknown error");
-    if (error) g_error_free(error);
-    g_free(line);
-    return;
-  }
-
-  chat_page_append_fmt(status, "→ WHOIS %s", nick);
+  gchar *line = g_strdup_printf("/whois %s", nick);
+  run_command(st, target, line);
   g_free(line);
 }
 
@@ -2145,6 +2124,7 @@ on_userlist_menu_copy(GtkMenuItem *mi, gpointer user_data)
   if (!st) return;
 
   const gchar *nick = g_object_get_data(G_OBJECT(mi), "zc-nick");
+  if (!nick) nick = g_object_get_data(G_OBJECT(mi), "zc-nick");
   if (!nick || !*nick) return;
 
   while (*nick && strchr("@+%&~", *nick)) nick++;
@@ -2274,8 +2254,7 @@ zcl_userlist_normalize_nick(const gchar *s) {
   if ((*s == '@' || *s == '+' || *s == '%' || *s == '~' || *s == '&') && s[1] != '\0') s++;
   return g_strdup(s);
 }
-
-zc_ui_create_main_window(GtkApplication *app) {
+GtkWidget *zc_ui_create_main_window(GtkApplication *app) {
   apply_css();
 
   UiState *st = g_new0(UiState, 1);
