@@ -46,15 +46,21 @@ ZcSettings *zc_settings_load(void) {
   GETSTR("connection","realname",realname)
   GETSTR("connection","auto_join",auto_join)
 
-  if (g_key_file_has_key(kf, "connection", "port", NULL))
-    s->port = (guint16)g_key_file_get_integer(kf, "connection", "port", NULL);
+  if (g_key_file_has_key(kf, "connection", "port", NULL)) {
+    const gint port_i = g_key_file_get_integer(kf, "connection", "port", NULL);
+    if (port_i > 0 && port_i <= 65535) s->port = (guint16)port_i;
+  }
   if (g_key_file_has_key(kf, "connection", "tls", NULL))
     s->tls = g_key_file_get_boolean(kf, "connection", "tls", NULL);
 
-  if (g_key_file_has_key(kf, "window", "width", NULL))
-    s->win_w = g_key_file_get_integer(kf, "window", "width", NULL);
-  if (g_key_file_has_key(kf, "window", "height", NULL))
-    s->win_h = g_key_file_get_integer(kf, "window", "height", NULL);
+  if (g_key_file_has_key(kf, "window", "width", NULL)) {
+    const gint w = g_key_file_get_integer(kf, "window", "width", NULL);
+    if (w > 0) s->win_w = w;
+  }
+  if (g_key_file_has_key(kf, "window", "height", NULL)) {
+    const gint h = g_key_file_get_integer(kf, "window", "height", NULL);
+    if (h > 0) s->win_h = h;
+  }
 
   g_key_file_free(kf);
   g_free(path);

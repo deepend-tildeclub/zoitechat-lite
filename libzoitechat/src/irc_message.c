@@ -32,8 +32,10 @@ zc_irc_message_copy(const ZcIrcMessage *src) {
   ZcIrcMessage *dst = zc_irc_message_new();
   dst->prefix = g_strdup(src->prefix);
   dst->command = g_strdup(src->command);
-  for (guint i = 0; i < src->params->len; i++) {
-    g_ptr_array_add(dst->params, g_strdup((const gchar *)g_ptr_array_index(src->params, i)));
+    if (src->params) {
+    for (guint i = 0; i < src->params->len; i++) {
+      g_ptr_array_add(dst->params, g_strdup((const gchar *)g_ptr_array_index(src->params, i)));
+    }
   }
   dst->trailing = g_strdup(src->trailing);
   return dst;
@@ -57,6 +59,8 @@ zc_irc_message_parse_line(const gchar *line) {
   if (!line) return NULL;
 
   const gchar *p = line;
+  while (*p && is_space(*p)) p++;
+
   ZcIrcMessage *msg = zc_irc_message_new();
 
   /* Prefix */

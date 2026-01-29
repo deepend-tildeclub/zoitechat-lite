@@ -101,6 +101,15 @@ static ChatPage *
 get_or_create_page(UiState *st, const gchar *target) {
   if (!target || !*target) target = "status";
   ChatPage *page = g_hash_table_lookup(st->pages, target);
+
+  /* ZCL_PAGES_STALE_GUARD_V1: tab widgets can be destroyed while ChatPage stays cached */
+  if (page) {
+    if (!chat_page_get_root(page) || !chat_page_get_buffer(page) || !chat_page_get_entry(page)) {
+      g_hash_table_remove(st->pages, target); /* key is freed (value_destroy is NULL) */
+      chat_page_free(page);
+      page = NULL;
+    }
+  }
   if (page) return page;
 
   page = chat_page_new(target);
@@ -122,33 +131,31 @@ get_or_create_page(UiState *st, const gchar *target) {
   GtkEntry *entry = GTK_ENTRY(chat_page_get_entry(page));
   g_object_set_data(G_OBJECT(entry), "zc-target", (gpointer)chat_page_get_target(page));
   g_object_set_data(G_OBJECT(entry), "zc-state", st);
-  g_signal_connect(entry, "activate", G_CALLBACK(on_entry_activate), NULL);
 
 
-  /* userlist: right-click context menu (only if this page has a userlist view) */
+  /* userlist: right-click context menu + double-click to open a query (channel tabs only) */
   GtkWidget *uv = chat_page_get_userlist_view(page);
-/* ZCL_USERLIST_SIGNALS_V1 */
-  // Hook userlist interactions only for channel pages.
-  // (DM/status tabs can have no userlist or should not DM-open on click.)
+
+  /* ZCL_USERLIST_SIGNALS_V2:
+   * - Hook signals exactly once per userlist view
+   * - Only for channel pages (DM/status tabs should not open queries from clicks)
+   */
   if (uv && GTK_IS_TREE_VIEW(uv)) {
     const gchar *tgt = chat_page_get_target(page);
     gboolean is_chan = (tgt && (tgt[0] == '#' || tgt[0] == '&' || tgt[0] == '!' || tgt[0] == '+'));
     if (is_chan) {
       gtk_widget_add_events(uv, GDK_BUTTON_PRESS_MASK);
-      g_signal_connect(uv, "row-activated", G_CALLBACK(zcl_userlist_row_activated), st);
-      g_signal_connect(uv, "button-press-event", G_CALLBACK(zcl_userlist_button_press), st);
+
+      if (!g_object_get_data(G_OBJECT(uv), "zc-userlist-row-hook")) {
+        g_signal_connect(uv, "row-activated", G_CALLBACK(zcl_userlist_row_activated), st);
+        g_object_set_data(G_OBJECT(uv), "zc-userlist-row-hook", GINT_TO_POINTER(1));
+      }
+
+      if (!g_object_get_data(G_OBJECT(uv), "zc-userlist-menu-hook")) {
+        g_signal_connect(uv, "button-press-event", G_CALLBACK(zcl_userlist_button_press), st);
+        g_object_set_data(G_OBJECT(uv), "zc-userlist-menu-hook", GINT_TO_POINTER(1));
+      }
     }
-  }
-
-  if (uv && !g_object_get_data(G_OBJECT(uv), "zc-userlist-menu-hook")) {
-    gtk_widget_add_events(uv, GDK_BUTTON_PRESS_MASK);
-    g_signal_connect(uv, "button-press-event", G_CALLBACK(zcl_userlist_button_press), st);
-    g_object_set_data(G_OBJECT(uv), "zc-userlist-menu-hook", GINT_TO_POINTER(1));
-  }
-
-  uv = chat_page_get_userlist_view(page);
-  if (uv) {
-    g_signal_connect(uv, "row-activated", G_CALLBACK(zcl_userlist_row_activated), st);
   }
 
   return page;
@@ -184,8 +191,10 @@ current_target(UiState *st) {
 static void
 ui_open_query(UiState *st, const gchar *nick) {
   if (!st || !nick || !*nick) return;
-  ChatPage *page = get_or_create_page(st, nick);
-  gtk_widget_grab_focus(GTK_WIDGET(chat_page_get_entry(page)));
+  /* Keep legacy helper, but delegate to the "real" implementation that also
+   * switches to an existing query tab if it already exists.
+   */
+  zcl_ui_open_query(st, nick);
 }
 
 static void
@@ -1923,7 +1932,10 @@ on_page_added(GtkNotebook *nb, GtkWidget *child, guint page_num, gpointer user_d
       GList *ek = gtk_container_get_children(GTK_CONTAINER(l->data));
       for (GList *e = ek; e; e = e->next) {
         if (GTK_IS_ENTRY(e->data)) {
-          g_signal_connect(e->data, "activate", G_CALLBACK(on_entry_activate), NULL);
+          if (!g_object_get_data(G_OBJECT(e->data), "zc-entry-hooked")) {
+            g_signal_connect(e->data, "activate", G_CALLBACK(on_entry_activate), NULL);
+            g_object_set_data(G_OBJECT(e->data), "zc-entry-hooked", GINT_TO_POINTER(1));
+          }
         }
       }
       g_list_free(ek);
@@ -1937,6 +1949,14 @@ on_page_added(GtkNotebook *nb, GtkWidget *child, guint page_num, gpointer user_d
 static void
 ui_state_free(UiState *st) {
   if (!st) return;
+
+  /* The client can outlive the window due to in-flight async I/O.
+   * Disconnect signal handlers first to avoid use-after-free when the client emits.
+   */
+  if (st->client) {
+    g_signal_handlers_disconnect_by_data(st->client, st);
+    zc_client_disconnect(st->client);
+  }
 
   if (st->settings && st->win && GTK_IS_WINDOW(st->win)) {
     gint w = 0, h = 0;
@@ -2187,8 +2207,14 @@ zcl_notebook_apply_close_button(UiState *st, GtkWidget *child) {
   gtk_label_set_width_chars(GTK_LABEL(lbl), 12);
   gtk_widget_set_halign(lbl, GTK_ALIGN_START);
 
-  GtkWidget *btn = gtk_button_new_from_icon_name("window-close-symbolic", GTK_ICON_SIZE_MENU);
-  if (!btn) btn = gtk_button_new_with_label("×");
+  GtkWidget *btn = gtk_button_new();
+  GtkWidget *img = gtk_image_new_from_icon_name("window-close-symbolic", GTK_ICON_SIZE_MENU);
+  if (img) {
+    gtk_button_set_image(GTK_BUTTON(btn), img);
+    gtk_button_set_always_show_image(GTK_BUTTON(btn), TRUE);
+  } else {
+    gtk_button_set_label(GTK_BUTTON(btn), "×");
+  }
   gtk_button_set_relief(GTK_BUTTON(btn), GTK_RELIEF_NONE);
   gtk_widget_set_focus_on_click(btn, FALSE);
   gtk_widget_set_tooltip_text(btn, "Close tab");
@@ -2211,21 +2237,31 @@ zcl_ui_close_target(UiState *st, const gchar *target, gboolean send_part) {
   ChatPage *page = (ChatPage *)g_hash_table_lookup(st->pages, target);
   if (!page) return;
 
-  if (send_part && (target[0] == '#' || target[0] == '&' || target[0] == '!' || target[0] == '+')) {
+  /* Use the ChatPage-owned target string for anything after we remove the tab.
+   * The tab's "zcl-target" data is freed when the child widget is destroyed. */
+  const gchar *safe_target = chat_page_get_target(page);
+  if (!safe_target || !*safe_target) safe_target = target;
+
+  if (send_part && (safe_target[0] == '#' || safe_target[0] == '&' || safe_target[0] == '!' || safe_target[0] == '+')) {
     if (st->client && zc_client_is_connected(st->client)) {
-      gchar *line = g_strdup_printf("PART %s :Closed", target);
+      gchar *line = g_strdup_printf("PART %s :Closed", safe_target);
       zc_client_send_raw(st->client, line, NULL);
       g_free(line);
     }
   }
 
   GtkWidget *child = chat_page_get_root(page);
-  gint idx = gtk_notebook_page_num(GTK_NOTEBOOK(st->notebook), child);
+  gint idx = child ? gtk_notebook_page_num(GTK_NOTEBOOK(st->notebook), child) : -1;
+
+  /* IMPORTANT: remove from hash before destroying the notebook page, because
+   * destroying the page frees the tab's "zcl-target" string. */
+  g_hash_table_remove(st->pages, safe_target);
+
   if (idx >= 0) gtk_notebook_remove_page(GTK_NOTEBOOK(st->notebook), idx);
 
-  g_hash_table_remove(st->pages, target);
   chat_page_free(page);
 }
+
 
 static void
 zcl_on_tab_close_clicked(GtkButton *btn, gpointer user_data) {

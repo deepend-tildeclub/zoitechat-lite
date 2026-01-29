@@ -94,6 +94,12 @@ chat_page_new(const gchar *target) {
   gtk_widget_set_vexpand(p->textview, TRUE);
   p->buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(p->textview));
 
+  /* ZCL_PAGE_WEAKPTR_V1: prevent stale cached tabs from crashing/blackholing output */
+  g_object_add_weak_pointer(G_OBJECT(p->root),    (gpointer *)&p->root);
+  g_object_add_weak_pointer(G_OBJECT(p->scroller),(gpointer *)&p->scroller);
+  g_object_add_weak_pointer(G_OBJECT(p->textview),(gpointer *)&p->textview);
+  g_object_add_weak_pointer(G_OBJECT(p->buffer),  (gpointer *)&p->buffer);
+
   gtk_container_add(GTK_CONTAINER(p->scroller), p->textview);
 
   /* Top row holds chat view (and channel user list, if applicable) */
@@ -132,6 +138,8 @@ chat_page_new(const gchar *target) {
   gtk_style_context_add_class(gtk_widget_get_style_context(entry_box), "zc-entry");
 
   p->entry = gtk_entry_new();
+  /* ZCL_PAGE_WEAKPTR_V1: track entry lifetime too (created later than buffer). */
+  g_object_add_weak_pointer(G_OBJECT(p->entry), (gpointer *)&p->entry);
   gtk_entry_set_placeholder_text(GTK_ENTRY(p->entry), "Type a message… (/join, /nick, /me, /msg, /query, /raw, /quit)");
   gtk_widget_set_hexpand(p->entry, TRUE);
 
@@ -146,6 +154,15 @@ chat_page_new(const gchar *target) {
 void
 chat_page_free(ChatPage *p) {
   if (!p) return;
+  /* Clean up weak pointers if still alive.
+   * Important: remove ALL weak pointers before freeing ChatPage, otherwise GTK
+   * can later write NULL into freed memory when widgets finalize.
+   */
+  if (p->buffer)   g_object_remove_weak_pointer(G_OBJECT(p->buffer),   (gpointer *)&p->buffer);
+  if (p->entry)    g_object_remove_weak_pointer(G_OBJECT(p->entry),    (gpointer *)&p->entry);
+  if (p->textview) g_object_remove_weak_pointer(G_OBJECT(p->textview), (gpointer *)&p->textview);
+  if (p->scroller) g_object_remove_weak_pointer(G_OBJECT(p->scroller), (gpointer *)&p->scroller);
+  if (p->root)     g_object_remove_weak_pointer(G_OBJECT(p->root),     (gpointer *)&p->root);
   g_free(p->target);
   g_free(p);
 }
@@ -249,6 +266,7 @@ void
 chat_page_append(ChatPage *p, const gchar *line) {
   if (!p || !line) return;
 
+  if (!p->buffer || !p->scroller) return;
   GtkTextIter end;
   gtk_text_buffer_get_end_iter(p->buffer, &end);
 
@@ -259,7 +277,11 @@ chat_page_append(ChatPage *p, const gchar *line) {
   g_free(full);
 
   GtkAdjustment *vadj = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(p->scroller));
-  gtk_adjustment_set_value(vadj, gtk_adjustment_get_upper(vadj));
+  gdouble upper = gtk_adjustment_get_upper(vadj);
+  gdouble page = gtk_adjustment_get_page_size(vadj);
+  gdouble value = upper - page;
+  if (value < 0) value = 0;
+  gtk_adjustment_set_value(vadj, value);
 }
 
 void
