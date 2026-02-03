@@ -18,6 +18,8 @@ app_sources = files(
   'app/chat_page.h',
   'app/settings.c',
   'app/settings.h',
+  'app/servlist.c',
+  'app/servlist.h',
 )
 
 executable(

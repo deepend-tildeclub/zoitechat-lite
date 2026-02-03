@@ -1,6 +1,7 @@
 #include "ui.h"
 #include <stdint.h>
 #include "chat_page.h"
+#include "servlist.h"
 #include "settings.h"
 
 static void on_connect_clicked(GtkButton *btn, gpointer user_data);
@@ -72,10 +73,14 @@ static gboolean on_window_configure(GtkWidget *w, GdkEventConfigure *ev, gpointe
 static gboolean on_window_delete(GtkWidget *w, GdkEvent *ev, gpointer user_data);
 static void zcl_window_store_size_if_reasonable(UiState *st, GtkWindow *win, gint w, gint h);
 static void zcl_settings_sync_and_save(UiState *st);
+static void refresh_network_combo(GtkComboBoxText *combo, const gchar *selected_name);
 
 static void on_userlist_menu_send_dm(GtkMenuItem *mi, gpointer user_data);
 static void on_userlist_menu_whois(GtkMenuItem *mi, gpointer user_data);
 static void on_userlist_menu_copy(GtkMenuItem *mi, gpointer user_data);
+
+static GtkEntry *host_combo_get_entry(GtkWidget *combo);
+static void host_combo_set_text(GtkWidget *combo, const gchar *text);
 
 static void
 ui_update_connect_toggle_button(UiState *st) {
@@ -1853,6 +1858,459 @@ on_entry_activate(GtkEntry *entry, gpointer user_data) {
   gtk_entry_set_text(entry, "");
 }
 
+static gchar *
+prompt_text(GtkWindow *parent, const gchar *title, const gchar *label_text, const gchar *initial) {
+  GtkWidget *dlg = gtk_dialog_new_with_buttons(
+    title,
+    parent,
+    GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+    "_Cancel", GTK_RESPONSE_CANCEL,
+    "_OK", GTK_RESPONSE_OK,
+    NULL
+  );
+
+  GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
+  GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+  gtk_container_set_border_width(GTK_CONTAINER(box), 12);
+  gtk_container_add(GTK_CONTAINER(content), box);
+
+  GtkWidget *label = gtk_label_new(label_text);
+  gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
+  gtk_box_pack_start(GTK_BOX(box), label, FALSE, FALSE, 0);
+
+  GtkWidget *entry = gtk_entry_new();
+  if (initial) gtk_entry_set_text(GTK_ENTRY(entry), initial);
+  gtk_box_pack_start(GTK_BOX(box), entry, FALSE, FALSE, 0);
+
+  gtk_widget_show_all(dlg);
+
+  gchar *result = NULL;
+  if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_OK) {
+    const gchar *text = gtk_entry_get_text(GTK_ENTRY(entry));
+    if (text && *text) result = g_strdup(text);
+  }
+
+  gtk_widget_destroy(dlg);
+  return result;
+}
+
+static GtkEntry *
+host_combo_get_entry(GtkWidget *combo) {
+  if (!combo) return NULL;
+  return GTK_ENTRY(gtk_bin_get_child(GTK_BIN(combo)));
+}
+
+static void
+host_combo_set_text(GtkWidget *combo, const gchar *text) {
+  GtkEntry *entry = host_combo_get_entry(combo);
+  if (!entry) return;
+  gtk_entry_set_text(entry, text ? text : "");
+}
+
+static const ZcServlistNetwork *
+servlist_find_network_by_name(const gchar *name) {
+  if (!name || !*name) return NULL;
+  gsize count = 0;
+  const ZcServlistNetwork *const *nets = zc_servlist_get_networks(&count);
+  for (gsize i = 0; i < count; i++) {
+    const ZcServlistNetwork *net = nets[i];
+    const gchar *net_name = zc_servlist_network_get_name(net);
+    if (g_strcmp0(net_name, name) == 0) return net;
+  }
+  return NULL;
+}
+
+static void
+servlist_refresh_network_list(GtkListBox *list) {
+  GList *rows = gtk_container_get_children(GTK_CONTAINER(list));
+  for (GList *l = rows; l; l = l->next) {
+    gtk_widget_destroy(GTK_WIDGET(l->data));
+  }
+  g_list_free(rows);
+
+  gsize count = 0;
+  const ZcServlistNetwork *const *nets = zc_servlist_get_networks(&count);
+  for (gsize i = 0; i < count; i++) {
+    const ZcServlistNetwork *net = nets[i];
+    const gchar *name = zc_servlist_network_get_name(net);
+    GtkWidget *row = gtk_list_box_row_new();
+    GtkWidget *label = gtk_label_new(name ? name : "");
+    gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
+    gtk_container_add(GTK_CONTAINER(row), label);
+    g_object_set_data(G_OBJECT(row), "zc-net", (gpointer)net);
+    gtk_container_add(GTK_CONTAINER(list), row);
+  }
+
+  gtk_widget_show_all(GTK_WIDGET(list));
+}
+
+static void
+servlist_refresh_server_list(GtkListBox *list, const ZcServlistNetwork *net) {
+  GList *rows = gtk_container_get_children(GTK_CONTAINER(list));
+  for (GList *l = rows; l; l = l->next) {
+    gtk_widget_destroy(GTK_WIDGET(l->data));
+  }
+  g_list_free(rows);
+
+  if (!net) {
+    gtk_widget_show_all(GTK_WIDGET(list));
+    return;
+  }
+
+  gsize count = 0;
+  const gchar *const *servers = zc_servlist_network_get_servers(net, &count);
+  for (gsize i = 0; i < count; i++) {
+    const gchar *spec = servers[i];
+    GtkWidget *row = gtk_list_box_row_new();
+    GtkWidget *label = gtk_label_new(spec ? spec : "");
+    gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
+    gtk_container_add(GTK_CONTAINER(row), label);
+    g_object_set_data(G_OBJECT(row), "zc-server-idx", GSIZE_TO_POINTER(i));
+    gtk_container_add(GTK_CONTAINER(list), row);
+  }
+
+  gtk_widget_show_all(GTK_WIDGET(list));
+}
+
+static void
+on_servlist_network_selected(GtkListBox *box, GtkListBoxRow *row, gpointer user_data) {
+  (void)box;
+  GtkListBox *server_list = GTK_LIST_BOX(user_data);
+  const ZcServlistNetwork *net = row ? g_object_get_data(G_OBJECT(row), "zc-net") : NULL;
+  servlist_refresh_server_list(server_list, net);
+}
+
+typedef struct {
+  GtkWindow *parent;
+  GtkListBox *net_list;
+  GtkListBox *srv_list;
+} ServlistDialogState;
+
+static ZcServlistNetwork *
+servlist_selected_network(ServlistDialogState *state) {
+  GtkListBoxRow *row = gtk_list_box_get_selected_row(state->net_list);
+  if (!row) return NULL;
+  return g_object_get_data(G_OBJECT(row), "zc-net");
+}
+
+static void
+servlist_on_add_network(GtkButton *btn, gpointer user_data) {
+  (void)btn;
+  ServlistDialogState *state = user_data;
+  gchar *name = prompt_text(state->parent, "Add Network", "Network name", NULL);
+  if (!name) return;
+  if (servlist_find_network_by_name(name)) {
+    g_free(name);
+    return;
+  }
+  zc_servlist_add_network(name);
+  zc_servlist_save();
+  g_free(name);
+  servlist_refresh_network_list(state->net_list);
+}
+
+static void
+servlist_on_rename_network(GtkButton *btn, gpointer user_data) {
+  (void)btn;
+  ServlistDialogState *state = user_data;
+  ZcServlistNetwork *net = servlist_selected_network(state);
+  if (!net) return;
+  const gchar *current = zc_servlist_network_get_name(net);
+  gchar *name = prompt_text(state->parent, "Rename Network", "Network name", current);
+  if (!name) return;
+  if (servlist_find_network_by_name(name)) {
+    g_free(name);
+    return;
+  }
+  zc_servlist_network_set_name(net, name);
+  zc_servlist_save();
+  g_free(name);
+  servlist_refresh_network_list(state->net_list);
+}
+
+static void
+servlist_on_remove_network(GtkButton *btn, gpointer user_data) {
+  (void)btn;
+  ServlistDialogState *state = user_data;
+  ZcServlistNetwork *net = servlist_selected_network(state);
+  if (!net) return;
+  if (zc_servlist_remove_network(net)) {
+    zc_servlist_save();
+    servlist_refresh_network_list(state->net_list);
+    servlist_refresh_server_list(state->srv_list, NULL);
+  }
+}
+
+static void
+servlist_on_add_server(GtkButton *btn, gpointer user_data) {
+  (void)btn;
+  ServlistDialogState *state = user_data;
+  ZcServlistNetwork *net = servlist_selected_network(state);
+  if (!net) return;
+  gchar *spec = prompt_text(state->parent, "Add Server", "Server (host or host/port)", NULL);
+  if (!spec) return;
+  if (zc_servlist_network_add_server(net, spec)) {
+    zc_servlist_save();
+    servlist_refresh_server_list(state->srv_list, net);
+  }
+  g_free(spec);
+}
+
+static void
+servlist_on_edit_server(GtkButton *btn, gpointer user_data) {
+  (void)btn;
+  ServlistDialogState *state = user_data;
+  ZcServlistNetwork *net = servlist_selected_network(state);
+  if (!net) return;
+  GtkListBoxRow *srv_row = gtk_list_box_get_selected_row(state->srv_list);
+  if (!srv_row) return;
+  gsize idx = GPOINTER_TO_SIZE(g_object_get_data(G_OBJECT(srv_row), "zc-server-idx"));
+  gsize count = 0;
+  const gchar *const *servers = zc_servlist_network_get_servers(net, &count);
+  const gchar *current = (idx < count) ? servers[idx] : NULL;
+  gchar *spec = prompt_text(state->parent, "Edit Server", "Server (host or host/port)", current);
+  if (!spec) return;
+  if (zc_servlist_network_update_server(net, idx, spec)) {
+    zc_servlist_save();
+    servlist_refresh_server_list(state->srv_list, net);
+  }
+  g_free(spec);
+}
+
+static void
+servlist_on_remove_server(GtkButton *btn, gpointer user_data) {
+  (void)btn;
+  ServlistDialogState *state = user_data;
+  ZcServlistNetwork *net = servlist_selected_network(state);
+  if (!net) return;
+  GtkListBoxRow *srv_row = gtk_list_box_get_selected_row(state->srv_list);
+  if (!srv_row) return;
+  gsize idx = GPOINTER_TO_SIZE(g_object_get_data(G_OBJECT(srv_row), "zc-server-idx"));
+  if (zc_servlist_network_remove_server(net, idx)) {
+    zc_servlist_save();
+    servlist_refresh_server_list(state->srv_list, net);
+  }
+}
+
+static void
+servlist_manage_dialog(UiState *st) {
+  GtkWidget *dlg = gtk_dialog_new_with_buttons(
+    "Server List",
+    GTK_WINDOW(st->win),
+    GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+    "_Close", GTK_RESPONSE_CLOSE,
+    NULL
+  );
+  gtk_window_set_default_size(GTK_WINDOW(dlg), 720, 420);
+  gtk_window_set_resizable(GTK_WINDOW(dlg), TRUE);
+
+  GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
+  GtkWidget *grid = gtk_grid_new();
+  gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
+  gtk_grid_set_column_spacing(GTK_GRID(grid), 12);
+  gtk_container_set_border_width(GTK_CONTAINER(grid), 12);
+  gtk_container_add(GTK_CONTAINER(content), grid);
+
+  GtkWidget *net_label = gtk_label_new("Networks");
+  gtk_label_set_xalign(GTK_LABEL(net_label), 0.0f);
+  GtkWidget *srv_label = gtk_label_new("Servers");
+  gtk_label_set_xalign(GTK_LABEL(srv_label), 0.0f);
+  gtk_grid_attach(GTK_GRID(grid), net_label, 0, 0, 1, 1);
+  gtk_grid_attach(GTK_GRID(grid), srv_label, 1, 0, 1, 1);
+
+  GtkWidget *net_list = gtk_list_box_new();
+  GtkWidget *srv_list = gtk_list_box_new();
+  gtk_list_box_set_selection_mode(GTK_LIST_BOX(net_list), GTK_SELECTION_SINGLE);
+  gtk_list_box_set_selection_mode(GTK_LIST_BOX(srv_list), GTK_SELECTION_SINGLE);
+
+  GtkWidget *net_scroll = gtk_scrolled_window_new(NULL, NULL);
+  GtkWidget *srv_scroll = gtk_scrolled_window_new(NULL, NULL);
+  gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(net_scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+  gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(srv_scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+  gtk_scrolled_window_set_shadow_type(GTK_SCROLLED_WINDOW(net_scroll), GTK_SHADOW_IN);
+  gtk_scrolled_window_set_shadow_type(GTK_SCROLLED_WINDOW(srv_scroll), GTK_SHADOW_IN);
+  gtk_widget_set_vexpand(net_scroll, TRUE);
+  gtk_widget_set_hexpand(net_scroll, TRUE);
+  gtk_widget_set_vexpand(srv_scroll, TRUE);
+  gtk_widget_set_hexpand(srv_scroll, TRUE);
+  gtk_container_add(GTK_CONTAINER(net_scroll), net_list);
+  gtk_container_add(GTK_CONTAINER(srv_scroll), srv_list);
+  gtk_grid_attach(GTK_GRID(grid), net_scroll, 0, 1, 1, 1);
+  gtk_grid_attach(GTK_GRID(grid), srv_scroll, 1, 1, 1, 1);
+
+  GtkWidget *net_btns = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+  GtkWidget *srv_btns = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+  gtk_grid_attach(GTK_GRID(grid), net_btns, 0, 2, 1, 1);
+  gtk_grid_attach(GTK_GRID(grid), srv_btns, 1, 2, 1, 1);
+
+  GtkWidget *net_add = gtk_button_new_with_label("Add");
+  GtkWidget *net_edit = gtk_button_new_with_label("Rename");
+  GtkWidget *net_remove = gtk_button_new_with_label("Remove");
+  gtk_box_pack_start(GTK_BOX(net_btns), net_add, FALSE, FALSE, 0);
+  gtk_box_pack_start(GTK_BOX(net_btns), net_edit, FALSE, FALSE, 0);
+  gtk_box_pack_start(GTK_BOX(net_btns), net_remove, FALSE, FALSE, 0);
+
+  GtkWidget *srv_add = gtk_button_new_with_label("Add");
+  GtkWidget *srv_edit = gtk_button_new_with_label("Edit");
+  GtkWidget *srv_remove = gtk_button_new_with_label("Remove");
+  gtk_box_pack_start(GTK_BOX(srv_btns), srv_add, FALSE, FALSE, 0);
+  gtk_box_pack_start(GTK_BOX(srv_btns), srv_edit, FALSE, FALSE, 0);
+  gtk_box_pack_start(GTK_BOX(srv_btns), srv_remove, FALSE, FALSE, 0);
+
+  ServlistDialogState state = {
+    .parent = GTK_WINDOW(st->win),
+    .net_list = GTK_LIST_BOX(net_list),
+    .srv_list = GTK_LIST_BOX(srv_list),
+  };
+
+  servlist_refresh_network_list(state.net_list);
+  g_signal_connect(net_list, "row-selected", G_CALLBACK(on_servlist_network_selected), srv_list);
+  g_signal_connect(net_add, "clicked", G_CALLBACK(servlist_on_add_network), &state);
+  g_signal_connect(net_edit, "clicked", G_CALLBACK(servlist_on_rename_network), &state);
+  g_signal_connect(net_remove, "clicked", G_CALLBACK(servlist_on_remove_network), &state);
+  g_signal_connect(srv_add, "clicked", G_CALLBACK(servlist_on_add_server), &state);
+  g_signal_connect(srv_edit, "clicked", G_CALLBACK(servlist_on_edit_server), &state);
+  g_signal_connect(srv_remove, "clicked", G_CALLBACK(servlist_on_remove_server), &state);
+
+  gtk_widget_show_all(dlg);
+  gtk_dialog_run(GTK_DIALOG(dlg));
+  gtk_widget_destroy(dlg);
+}
+
+static void
+on_network_changed(GtkComboBox *combo, gpointer user_data) {
+  (void)user_data;
+  GtkWidget *host_combo = g_object_get_data(G_OBJECT(combo), "zc-host-combo");
+  GtkWidget *port = g_object_get_data(G_OBJECT(combo), "zc-port-spin");
+  GtkWidget *tls = g_object_get_data(G_OBJECT(combo), "zc-tls-toggle");
+  GtkWidget *join = g_object_get_data(G_OBJECT(combo), "zc-join-entry");
+  if (!host_combo || !port || !tls) return;
+
+  gchar *selected = gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(combo));
+  if (!selected || g_strcmp0(selected, "Custom") == 0) {
+    gtk_combo_box_text_remove_all(GTK_COMBO_BOX_TEXT(host_combo));
+    g_free(selected);
+    return;
+  }
+
+  const ZcServlistNetwork *net = servlist_find_network_by_name(selected);
+  g_free(selected);
+  if (!net) return;
+
+  gsize server_count = 0;
+  const gchar *const *servers = zc_servlist_network_get_servers(net, &server_count);
+  if (!servers || server_count == 0) return;
+
+  GtkComboBoxText *host_combo_text = GTK_COMBO_BOX_TEXT(host_combo);
+  GtkEntry *host_entry = host_combo_get_entry(host_combo);
+  const gchar *current_host = host_entry ? gtk_entry_get_text(host_entry) : NULL;
+  gtk_combo_box_text_remove_all(host_combo_text);
+  for (gsize i = 0; i < server_count; i++) {
+    if (servers[i]) gtk_combo_box_text_append_text(host_combo_text, servers[i]);
+  }
+
+  gint active = 0;
+  if (current_host && *current_host) {
+    for (gsize i = 0; i < server_count; i++) {
+      gchar *resolved_host = NULL;
+      zc_servlist_parse_server(net, servers[i], &resolved_host, NULL, NULL);
+      gboolean match = resolved_host && g_strcmp0(resolved_host, current_host) == 0;
+      g_free(resolved_host);
+      if (match) {
+        active = (gint)i;
+        break;
+      }
+    }
+  }
+  gtk_combo_box_set_active(GTK_COMBO_BOX(host_combo), active);
+
+  gchar *resolved_host = NULL;
+  guint16 resolved_port = 0;
+  gboolean resolved_tls = FALSE;
+  zc_servlist_parse_server(net, servers[active], &resolved_host, &resolved_port, &resolved_tls);
+
+  if (resolved_host) {
+    host_combo_set_text(host_combo, resolved_host);
+    g_free(resolved_host);
+  }
+  if (resolved_port > 0) gtk_spin_button_set_value(GTK_SPIN_BUTTON(port), resolved_port);
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(tls), resolved_tls);
+
+  if (join) {
+    const gchar *default_chan = zc_servlist_network_get_default_channel(net);
+    const gchar *current = gtk_entry_get_text(GTK_ENTRY(join));
+    if (default_chan && (!current || !*current)) {
+      gtk_entry_set_text(GTK_ENTRY(join), default_chan);
+    }
+  }
+}
+
+static void
+on_host_changed(GtkComboBox *combo, gpointer user_data) {
+  GtkWidget *network_combo = user_data;
+  GtkWidget *port = g_object_get_data(G_OBJECT(combo), "zc-port-spin");
+  GtkWidget *tls = g_object_get_data(G_OBJECT(combo), "zc-tls-toggle");
+  if (!port || !tls) return;
+
+  GtkEntry *entry = host_combo_get_entry(GTK_WIDGET(combo));
+  const gchar *host_text = entry ? gtk_entry_get_text(entry) : NULL;
+  if (!host_text || !*host_text) return;
+
+  const ZcServlistNetwork *net = NULL;
+  if (network_combo) {
+    gchar *selected = gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(network_combo));
+    if (selected && g_strcmp0(selected, "Custom") != 0) {
+      net = servlist_find_network_by_name(selected);
+    }
+    g_free(selected);
+  }
+
+  gchar *resolved_host = NULL;
+  guint16 resolved_port = 0;
+  gboolean resolved_tls = FALSE;
+  zc_servlist_parse_server(net, host_text, &resolved_host, &resolved_port, &resolved_tls);
+  if (resolved_host) {
+    host_combo_set_text(GTK_WIDGET(combo), resolved_host);
+    g_free(resolved_host);
+  }
+  if (resolved_port > 0) gtk_spin_button_set_value(GTK_SPIN_BUTTON(port), resolved_port);
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(tls), resolved_tls);
+}
+
+static void
+on_manage_servlist_clicked(GtkButton *btn, gpointer user_data) {
+  UiState *st = user_data;
+  GtkComboBoxText *combo = g_object_get_data(G_OBJECT(btn), "zc-network-combo");
+  gchar *selected = gtk_combo_box_text_get_active_text(combo);
+  servlist_manage_dialog(st);
+  refresh_network_combo(combo, selected);
+  g_free(selected);
+}
+
+static void
+refresh_network_combo(GtkComboBoxText *combo, const gchar *selected_name) {
+  gtk_combo_box_text_remove_all(combo);
+  gtk_combo_box_text_append_text(combo, "Custom");
+  gsize count = 0;
+  const ZcServlistNetwork *const *nets = zc_servlist_get_networks(&count);
+  for (gsize i = 0; i < count; i++) {
+    const gchar *name = zc_servlist_network_get_name(nets[i]);
+    if (name) gtk_combo_box_text_append_text(combo, name);
+  }
+
+  gint active = 0;
+  if (selected_name) {
+    for (gsize i = 0; i < count; i++) {
+      const gchar *candidate = zc_servlist_network_get_name(nets[i]);
+      if (g_strcmp0(candidate, selected_name) == 0) {
+        active = (gint)i + 1;
+        break;
+      }
+    }
+  }
+  gtk_combo_box_set_active(GTK_COMBO_BOX(combo), active);
+}
+
 static GtkWidget *
 connect_dialog(UiState *st) {
   GtkWidget *dlg = gtk_dialog_new_with_buttons(
@@ -1871,8 +2329,21 @@ connect_dialog(UiState *st) {
   gtk_container_set_border_width(GTK_CONTAINER(grid), 12);
   gtk_container_add(GTK_CONTAINER(content), grid);
 
-  GtkWidget *host = gtk_entry_new();
-  gtk_entry_set_text(GTK_ENTRY(host), st->host ? st->host : "irc.libera.chat");
+  GtkWidget *network = gtk_combo_box_text_new();
+  gsize network_count = 0;
+  const ZcServlistNetwork *const *nets = zc_servlist_get_networks(&network_count);
+  gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(network), "Custom");
+  for (gsize i = 0; i < network_count; i++) {
+    const gchar *name = zc_servlist_network_get_name(nets[i]);
+    if (name) gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(network), name);
+  }
+  GtkWidget *manage = gtk_button_new_with_label("Manage…");
+  GtkWidget *network_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+  gtk_box_pack_start(GTK_BOX(network_box), network, TRUE, TRUE, 0);
+  gtk_box_pack_start(GTK_BOX(network_box), manage, FALSE, FALSE, 0);
+
+  GtkWidget *host = gtk_combo_box_text_new_with_entry();
+  host_combo_set_text(host, st->host ? st->host : "irc.libera.chat");
 
   GtkWidget *port = gtk_spin_button_new_with_range(1, 65535, 1);
   gtk_spin_button_set_value(GTK_SPIN_BUTTON(port), st->port ? st->port : 6697);
@@ -1893,6 +2364,9 @@ connect_dialog(UiState *st) {
   gtk_entry_set_text(GTK_ENTRY(join), st->auto_join ? st->auto_join : "#zoite");
 
   int r = 0;
+  gtk_grid_attach(GTK_GRID(grid), gtk_label_new("Network"), 0, r, 1, 1);
+  gtk_grid_attach(GTK_GRID(grid), network_box, 1, r++, 1, 1);
+
   gtk_grid_attach(GTK_GRID(grid), gtk_label_new("Host"), 0, r, 1, 1);
   gtk_grid_attach(GTK_GRID(grid), host, 1, r++, 1, 1);
 
@@ -1913,6 +2387,33 @@ connect_dialog(UiState *st) {
   gtk_grid_attach(GTK_GRID(grid), gtk_label_new("Auto-join"), 0, r, 1, 1);
   gtk_grid_attach(GTK_GRID(grid), join, 1, r++, 1, 1);
 
+  g_object_set_data(G_OBJECT(network), "zc-host-combo", host);
+  g_object_set_data(G_OBJECT(network), "zc-port-spin", port);
+  g_object_set_data(G_OBJECT(network), "zc-tls-toggle", tls);
+  g_object_set_data(G_OBJECT(network), "zc-join-entry", join);
+  g_signal_connect(network, "changed", G_CALLBACK(on_network_changed), NULL);
+  g_object_set_data(G_OBJECT(host), "zc-port-spin", port);
+  g_object_set_data(G_OBJECT(host), "zc-tls-toggle", tls);
+  g_signal_connect(host, "changed", G_CALLBACK(on_host_changed), network);
+  g_signal_connect(manage, "clicked", G_CALLBACK(on_manage_servlist_clicked), st);
+  g_object_set_data(G_OBJECT(manage), "zc-network-combo", network);
+
+  const ZcServlistNetwork *selected_net = zc_servlist_find_network_by_host(st->host);
+  if (selected_net) {
+    const gchar *name = zc_servlist_network_get_name(selected_net);
+    gint active_index = 0;
+    for (gsize i = 0; i < network_count; i++) {
+      const gchar *candidate = zc_servlist_network_get_name(nets[i]);
+      if (g_strcmp0(candidate, name) == 0) {
+        active_index = (gint)i + 1;
+        break;
+      }
+    }
+    gtk_combo_box_set_active(GTK_COMBO_BOX(network), active_index);
+  } else {
+    gtk_combo_box_set_active(GTK_COMBO_BOX(network), 0);
+  }
+
   gtk_widget_show_all(dlg);
 
   gint resp = gtk_dialog_run(GTK_DIALOG(dlg));
@@ -1923,7 +2424,8 @@ connect_dialog(UiState *st) {
     g_free(st->realname);
     g_free(st->auto_join);
 
-    st->host = g_strdup(gtk_entry_get_text(GTK_ENTRY(host)));
+    GtkEntry *host_entry = host_combo_get_entry(host);
+    st->host = g_strdup(host_entry ? gtk_entry_get_text(host_entry) : "");
     st->port = (guint16)gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(port));
     st->tls = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(tls));
     st->nick = g_strdup(gtk_entry_get_text(GTK_ENTRY(nick)));
