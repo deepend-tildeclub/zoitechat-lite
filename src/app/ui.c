@@ -1883,6 +1883,104 @@ zcl_input_history_add(UiState *st, const gchar *text) {
   zcl_input_history_reset(st);
 }
 
+static gchar *
+zcl_entry_find_nick_completion(UiState *st, const gchar *chan, const gchar *prefix) {
+  if (!st || !st->chan_users || !is_channel_name(chan) || !prefix || !*prefix) return NULL;
+
+  GHashTable *map = g_hash_table_lookup(st->chan_users, chan);
+  if (!map) return NULL;
+
+  GList *matches = NULL;
+  GHashTableIter it;
+  gpointer k;
+  g_hash_table_iter_init(&it, map);
+  while (g_hash_table_iter_next(&it, &k, NULL)) {
+    const gchar *nick = (const gchar *)k;
+    if (!nick) continue;
+    if (g_ascii_strncasecmp(nick, prefix, strlen(prefix)) == 0) {
+      matches = g_list_prepend(matches, g_strdup(nick));
+    }
+  }
+
+  if (!matches) return NULL;
+
+  matches = g_list_sort(matches, (GCompareFunc)g_ascii_strcasecmp);
+  gchar *result = g_strdup((const gchar *)matches->data);
+  g_list_free_full(matches, g_free);
+  return result;
+}
+
+static gboolean
+zcl_entry_handle_tab_complete(GtkEntry *entry, GdkEventKey *ev, UiState *st) {
+  if (!entry || !ev || !st) return FALSE;
+  if (ev->keyval != GDK_KEY_Tab) return FALSE;
+
+  const gchar *target = (const gchar *)g_object_get_data(G_OBJECT(entry), "zc-target");
+  if (!target || !*target) target = current_target(st);
+  if (!is_channel_name(target)) return TRUE;
+
+  const gchar *text = gtk_entry_get_text(entry);
+  if (!text) return TRUE;
+
+  gint cursor_pos = gtk_editable_get_position(GTK_EDITABLE(entry));
+  gint text_len = g_utf8_strlen(text, -1);
+  if (cursor_pos < 0 || cursor_pos > text_len) cursor_pos = text_len;
+
+  const gchar *cursor_ptr = g_utf8_offset_to_pointer(text, cursor_pos);
+  const gchar *start_ptr = cursor_ptr;
+  while (start_ptr > text) {
+    const gchar *prev = g_utf8_prev_char(start_ptr);
+    if (g_unichar_isspace(g_utf8_get_char(prev))) break;
+    start_ptr = prev;
+  }
+
+  if (start_ptr == cursor_ptr) return TRUE;
+
+  const gchar *token_ptr = start_ptr;
+  gchar mention_prefix = 0;
+  if (*token_ptr && strchr("@+%~&", *token_ptr)) {
+    mention_prefix = *token_ptr;
+    token_ptr = g_utf8_next_char(token_ptr);
+  }
+
+  gchar *token = g_strndup(token_ptr, cursor_ptr - token_ptr);
+  if (!token || !*token) {
+    g_free(token);
+    return TRUE;
+  }
+
+  gchar *completion = zcl_entry_find_nick_completion(st, target, token);
+  g_free(token);
+  if (!completion) return TRUE;
+
+  GString *new_text = g_string_new_len(text, start_ptr - text);
+  if (mention_prefix) g_string_append_c(new_text, mention_prefix);
+  g_string_append(new_text, completion);
+
+  const gchar *rest_ptr = cursor_ptr;
+  if (start_ptr == text) {
+    g_string_append_c(new_text, ':');
+    if (!rest_ptr || !*rest_ptr || !g_unichar_isspace(g_utf8_get_char(rest_ptr))) {
+      g_string_append_c(new_text, ' ');
+    }
+  }
+
+  g_string_append(new_text, rest_ptr);
+
+  gsize insert_bytes = (start_ptr - text)
+    + (mention_prefix ? 1 : 0)
+    + strlen(completion)
+    + ((start_ptr == text) ? 1 : 0)
+    + ((start_ptr == text && (!rest_ptr || !*rest_ptr || !g_unichar_isspace(g_utf8_get_char(rest_ptr)))) ? 1 : 0);
+
+  gtk_entry_set_text(entry, new_text->str);
+  gtk_editable_set_position(GTK_EDITABLE(entry), (gint)g_utf8_strlen(new_text->str, insert_bytes));
+
+  g_string_free(new_text, TRUE);
+  g_free(completion);
+  return TRUE;
+}
+
 static void
 on_entry_activate(GtkEntry *entry, gpointer user_data) {
   (void)user_data;
@@ -1902,6 +2000,8 @@ static gboolean
 on_entry_key_press(GtkWidget *entry, GdkEventKey *ev, gpointer user_data) {
   UiState *st = (UiState *)user_data;
   if (!st || !GTK_IS_ENTRY(entry) || !ev) return FALSE;
+
+  if (zcl_entry_handle_tab_complete(GTK_ENTRY(entry), ev, st)) return TRUE;
 
   if (!st->input_history || st->input_history->len == 0) return FALSE;
 
