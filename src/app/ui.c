@@ -1,6 +1,7 @@
 #include "ui.h"
 #include <stdint.h>
 #include "chat_page.h"
+#include "ansi_format.h"
 #include "servlist.h"
 #include "settings.h"
 
@@ -289,7 +290,10 @@ get_or_create_page(UiState *st, const gchar *target) {
   g_hash_table_insert(st->pages, g_strdup(target), page);
   g_object_set_data_full(G_OBJECT(root), "zcl-target", g_strdup(target), g_free);
 
-  GtkWidget *tab = gtk_label_new(target);
+  GtkWidget *tab = gtk_label_new(NULL);
+  gchar *tab_markup = zcl_ansi_to_markup(target);
+  gtk_label_set_markup(GTK_LABEL(tab), tab_markup);
+  g_free(tab_markup);
   gtk_widget_set_halign(tab, GTK_ALIGN_START);
 
   gint idx = gtk_notebook_append_page(GTK_NOTEBOOK(st->notebook), root, tab);
@@ -3122,27 +3126,9 @@ static gchar *
 userlist_extract_nick(GtkTreeModel *model, GtkTreeIter *iter) {
   if (!model || !iter) return NULL;
 
-  const gint ncols = gtk_tree_model_get_n_columns(model);
-  for (gint col = 0; col < ncols; col++) {
-    GValue v = G_VALUE_INIT;
-    gtk_tree_model_get_value(model, iter, col, &v);
-
-    if (G_VALUE_HOLDS_STRING(&v)) {
-      const gchar *sv = g_value_get_string(&v);
-      if (sv && sv[0]) {
-        /* Ignore pure prefix columns like "@", "+", etc. */
-        if (!(sv[1] == '\0' && (sv[0] == '~' || sv[0] == '&' || sv[0] == '@' || sv[0] == '%' || sv[0] == '+'))) {
-          gchar *out = g_strdup(sv);
-          g_value_unset(&v);
-          return out;
-        }
-      }
-    }
-
-    g_value_unset(&v);
-  }
-
-  return NULL;
+  gchar *nick = NULL;
+  gtk_tree_model_get(model, iter, ZC_USERLIST_COL_NICK, &nick, -1);
+  return nick;
 }
 
 static void

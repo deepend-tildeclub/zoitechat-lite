@@ -12,6 +12,8 @@ resources = gnome.compile_resources(
 
 app_sources = files(
   'app/main.c',
+  'app/ansi_format.c',
+  'app/ansi_format.h',
   'app/ui.c',
   'app/ui.h',
   'app/chat_page.c',
