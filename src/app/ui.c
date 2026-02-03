@@ -12,6 +12,10 @@ static void on_disconnect_clicked(GtkButton *btn, gpointer user_data);
 #include "zoitechat/zoitechat.h"
 #include "zoitechat/irc_message.h"
 
+#ifdef GDK_WINDOWING_WAYLAND
+#include <gdk/gdkwayland.h>
+#endif
+
 typedef struct {
   GtkApplication *app;
   GtkWidget *win;
@@ -248,28 +252,22 @@ static void
 ui_apply_window_icon(GtkWindow *win) {
   if (!win) return;
 
-  /* Prefer the icon theme name everywhere. */
-  gtk_window_set_default_icon_name("net.zoite.ZoiteChatLite");
   gtk_window_set_icon_name(win, "net.zoite.ZoiteChatLite");
+}
 
-  /* Dev runs: make sure the repo icon is visible to the icon theme. */
-  GtkIconTheme *theme = gtk_icon_theme_get_default();
-  if (theme && g_file_test("data/icons", G_FILE_TEST_IS_DIR)) {
-    gtk_icon_theme_append_search_path(theme, "data/icons");
-  }
-
-  /* Some WMs/shells ignore icon-name unless we also set a pixbuf. */
-  if (theme) {
-    GError *e = NULL;
-    GdkPixbuf *pix = gtk_icon_theme_load_icon(theme, "net.zoite.ZoiteChatLite", 128, 0, &e);
-    if (!pix && e) {
-      g_clear_error(&e);
-    }
-    if (pix) {
-      gtk_window_set_icon(win, pix);
-      g_object_unref(pix);
+static void
+ui_apply_window_app_id(GtkWidget *widget) {
+#ifdef GDK_WINDOWING_WAYLAND
+  GdkDisplay *display = gdk_display_get_default();
+  if (display && GDK_IS_WAYLAND_DISPLAY(display)) {
+    GdkWindow *gdk_win = gtk_widget_get_window(widget);
+    if (gdk_win) {
+      gdk_wayland_window_set_application_id(gdk_win, "net.zoite.ZoiteChatLite");
     }
   }
+#else
+  (void)widget;
+#endif
 }
 
 static void
@@ -292,25 +290,8 @@ on_about_zoitechat(GtkButton *btn, gpointer user_data) {
 
   
 
-  gtk_window_set_default_icon_name("net.zoite.ZoiteChatLite");
-  gtk_window_set_icon_name(GTK_WINDOW(dlg), "net.zoite.ZoiteChatLite");
-
-/* force about dialog window icon */
-gtk_window_set_default_icon_name("net.zoite.ZoiteChatLite");
-gtk_window_set_icon_name(GTK_WINDOW(dlg), "net.zoite.ZoiteChatLite");
-
-/* Plasma can ignore icon-name for dialogs unless we also set an explicit pixbuf. */
-GtkIconTheme *theme = gtk_icon_theme_get_default();
-if (theme) {
-  GError *e = NULL;
-  GdkPixbuf *pix = gtk_icon_theme_load_icon(theme, "net.zoite.ZoiteChatLite", 128, 0, &e);
-  if (pix) {
-    gtk_window_set_icon(GTK_WINDOW(dlg), pix);
-    g_object_unref(pix);
-  }
-  if (e) g_clear_error(&e);
-}
-ui_apply_window_icon(GTK_WINDOW(dlg));
+  ui_apply_window_icon(GTK_WINDOW(dlg));
+  g_signal_connect(dlg, "realize", G_CALLBACK(ui_apply_window_app_id), NULL);
 
   GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
   GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
@@ -318,10 +299,12 @@ ui_apply_window_icon(GTK_WINDOW(dlg));
   gtk_container_add(GTK_CONTAINER(area), box);
 
   /* Logo (same icon as the app) */
-GtkWidget *img = gtk_image_new_from_icon_name("net.zoite.ZoiteChatLite", GTK_ICON_SIZE_DIALOG);
-gtk_image_set_pixel_size(GTK_IMAGE(img), 96);
-gtk_widget_set_halign(img, GTK_ALIGN_CENTER);
-gtk_box_pack_start(GTK_BOX(box), img, FALSE, FALSE, 0);GtkWidget *title = gtk_label_new(NULL);
+  GtkWidget *img = gtk_image_new_from_icon_name("net.zoite.ZoiteChatLite", GTK_ICON_SIZE_DIALOG);
+  gtk_image_set_pixel_size(GTK_IMAGE(img), 96);
+  gtk_widget_set_halign(img, GTK_ALIGN_CENTER);
+  gtk_box_pack_start(GTK_BOX(box), img, FALSE, FALSE, 0);
+
+  GtkWidget *title = gtk_label_new(NULL);
   gtk_label_set_markup(GTK_LABEL(title), "<b>ZoiteChat Lite</b>");
   gtk_widget_set_halign(title, GTK_ALIGN_CENTER);
   gtk_box_pack_start(GTK_BOX(box), title, FALSE, FALSE, 0);
@@ -2423,29 +2406,9 @@ GtkWidget *zc_ui_create_main_window(GtkApplication *app) {
   st->pages = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
 
   st->win = gtk_application_window_new(app);
-/* Icons: use the one true icon everywhere (dev + installed). */
+  /* Icons: use the one true icon everywhere (dev + installed). */
   ui_apply_window_icon(GTK_WINDOW(st->win));
-
-GtkIconTheme *theme = gtk_icon_theme_get_default();
-if (theme && g_file_test("data/icons", G_FILE_TEST_IS_DIR)) {
-  /* So gtk_image_new_from_icon_name("net.zoite.ZoiteChatLite", ...) resolves in dev runs. */
-  gtk_icon_theme_append_search_path(theme, "data/icons");
-}
-
-gtk_window_set_default_icon_name("net.zoite.ZoiteChatLite");
-gtk_window_set_icon_name(GTK_WINDOW(st->win), "net.zoite.ZoiteChatLite");
-
-/* Some shells ignore icon-name unless the app is installed. Set the window icon directly from the SVG in dev runs. */
-if (g_file_test("data/icons/hicolor/scalable/apps/net.zoite.ZoiteChatLite.svg", G_FILE_TEST_EXISTS)) {
-  GError *e = NULL;
-  GdkPixbuf *pix = gdk_pixbuf_new_from_file_at_scale("data/icons/hicolor/scalable/apps/net.zoite.ZoiteChatLite.svg", 128, 128, TRUE, &e);
-  if (pix) {
-    gtk_window_set_icon(GTK_WINDOW(st->win), pix);
-    g_object_unref(pix);
-  } else {
-    g_clear_error(&e);
-  }
-}
+  g_signal_connect(st->win, "realize", G_CALLBACK(ui_apply_window_app_id), NULL);
   gtk_window_set_default_size(GTK_WINDOW(st->win), st->last_win_w, st->last_win_h);
   gtk_window_set_title(GTK_WINDOW(st->win), "ZoiteChat Lite");
   gtk_window_set_position(GTK_WINDOW(st->win), GTK_WIN_POS_CENTER);
