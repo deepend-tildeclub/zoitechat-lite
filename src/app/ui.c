@@ -9,6 +9,7 @@ static void on_disconnect_clicked(GtkButton *btn, gpointer user_data);
 
 #include <gio/gio.h>
 #include <string.h>
+#include <gdk/gdkkeysyms.h>
 
 #include "zoitechat/zoitechat.h"
 #include "zoitechat/irc_message.h"
@@ -50,6 +51,11 @@ typedef struct {
   /* last known normal window size (avoid saving 1x1 during teardown) */
   gint last_win_w;
   gint last_win_h;
+
+  /* input history for chat entries */
+  GPtrArray *input_history;
+  gint input_history_pos;
+  gchar *input_history_draft;
 } UiState;
 
 
@@ -111,6 +117,7 @@ is_channel_name(const gchar *s) {
 
 
 static void on_entry_activate(GtkEntry *entry, gpointer user_data);
+static gboolean on_entry_key_press(GtkWidget *entry, GdkEventKey *ev, gpointer user_data);
 static void
 zcl_userlist_row_activated(GtkTreeView *tv, GtkTreePath *path, GtkTreeViewColumn *col, gpointer user_data);
 
@@ -149,6 +156,10 @@ get_or_create_page(UiState *st, const gchar *target) {
   GtkEntry *entry = GTK_ENTRY(chat_page_get_entry(page));
   g_object_set_data(G_OBJECT(entry), "zc-target", (gpointer)chat_page_get_target(page));
   g_object_set_data(G_OBJECT(entry), "zc-state", st);
+  if (!g_object_get_data(G_OBJECT(entry), "zc-entry-key-hooked")) {
+    g_signal_connect(entry, "key-press-event", G_CALLBACK(on_entry_key_press), st);
+    g_object_set_data(G_OBJECT(entry), "zc-entry-key-hooked", GINT_TO_POINTER(1));
+  }
 
 
   /* userlist: right-click context menu + double-click to open a query (channel tabs only) */
@@ -1847,6 +1858,32 @@ run_command(UiState *st, const gchar *target, const gchar *line) {
 }
 
 static void
+zcl_input_history_reset(UiState *st) {
+  if (!st) return;
+  st->input_history_pos = st->input_history ? (gint)st->input_history->len : 0;
+  g_clear_pointer(&st->input_history_draft, g_free);
+}
+
+static void
+zcl_input_history_add(UiState *st, const gchar *text) {
+  if (!st || !text || !*text) return;
+  if (!st->input_history) {
+    st->input_history = g_ptr_array_new_with_free_func(g_free);
+  }
+
+  if (st->input_history->len > 0) {
+    const gchar *last = g_ptr_array_index(st->input_history, st->input_history->len - 1);
+    if (g_strcmp0(last, text) == 0) {
+      zcl_input_history_reset(st);
+      return;
+    }
+  }
+
+  g_ptr_array_add(st->input_history, g_strdup(text));
+  zcl_input_history_reset(st);
+}
+
+static void
 on_entry_activate(GtkEntry *entry, gpointer user_data) {
   (void)user_data;
   UiState *st = (UiState *)g_object_get_data(G_OBJECT(entry), "zc-state");
@@ -1854,8 +1891,58 @@ on_entry_activate(GtkEntry *entry, gpointer user_data) {
   const gchar *text = gtk_entry_get_text(entry);
   if (!st || !text) return;
 
+  if (*text) {
+    zcl_input_history_add(st, text);
+  }
   run_command(st, target ? target : current_target(st), text);
   gtk_entry_set_text(entry, "");
+}
+
+static gboolean
+on_entry_key_press(GtkWidget *entry, GdkEventKey *ev, gpointer user_data) {
+  UiState *st = (UiState *)user_data;
+  if (!st || !GTK_IS_ENTRY(entry) || !ev) return FALSE;
+
+  if (!st->input_history || st->input_history->len == 0) return FALSE;
+
+  const gboolean up = (ev->keyval == GDK_KEY_Up || ev->keyval == GDK_KEY_KP_Up);
+  const gboolean down = (ev->keyval == GDK_KEY_Down || ev->keyval == GDK_KEY_KP_Down);
+  if (!up && !down) return FALSE;
+
+  const gint len = (gint)st->input_history->len;
+  if (st->input_history_pos < 0 || st->input_history_pos > len) {
+    st->input_history_pos = len;
+  }
+
+  if (up) {
+    if (st->input_history_pos == len) {
+      g_clear_pointer(&st->input_history_draft, g_free);
+      st->input_history_draft = g_strdup(gtk_entry_get_text(GTK_ENTRY(entry)));
+    }
+    if (st->input_history_pos > 0) {
+      st->input_history_pos--;
+      const gchar *text = g_ptr_array_index(st->input_history, st->input_history_pos);
+      gtk_entry_set_text(GTK_ENTRY(entry), text ? text : "");
+      gtk_editable_set_position(GTK_EDITABLE(entry), -1);
+      return TRUE;
+    }
+  } else if (down) {
+    if (st->input_history_pos < len - 1) {
+      st->input_history_pos++;
+      const gchar *text = g_ptr_array_index(st->input_history, st->input_history_pos);
+      gtk_entry_set_text(GTK_ENTRY(entry), text ? text : "");
+      gtk_editable_set_position(GTK_EDITABLE(entry), -1);
+      return TRUE;
+    }
+    if (st->input_history_pos == len - 1) {
+      st->input_history_pos = len;
+      gtk_entry_set_text(GTK_ENTRY(entry), st->input_history_draft ? st->input_history_draft : "");
+      gtk_editable_set_position(GTK_EDITABLE(entry), -1);
+      return TRUE;
+    }
+  }
+
+  return FALSE;
 }
 
 static gchar *
@@ -2523,6 +2610,10 @@ on_page_added(GtkNotebook *nb, GtkWidget *child, guint page_num, gpointer user_d
             g_signal_connect(e->data, "activate", G_CALLBACK(on_entry_activate), NULL);
             g_object_set_data(G_OBJECT(e->data), "zc-entry-hooked", GINT_TO_POINTER(1));
           }
+          if (!g_object_get_data(G_OBJECT(e->data), "zc-entry-key-hooked")) {
+            g_signal_connect(e->data, "key-press-event", G_CALLBACK(on_entry_key_press), st);
+            g_object_set_data(G_OBJECT(e->data), "zc-entry-key-hooked", GINT_TO_POINTER(1));
+          }
         }
       }
       g_list_free(ek);
@@ -2630,6 +2721,12 @@ ui_state_free(UiState *st) {
     }
     g_hash_table_destroy(st->pages);
   }
+
+  if (st->input_history) {
+    g_ptr_array_free(st->input_history, TRUE);
+    st->input_history = NULL;
+  }
+  g_clear_pointer(&st->input_history_draft, g_free);
 
   g_clear_object(&st->client);
   g_free(st);
@@ -2947,6 +3044,9 @@ GtkWidget *zc_ui_create_main_window(GtkApplication *app) {
 
 
   st->pages = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+  st->input_history = g_ptr_array_new_with_free_func(g_free);
+  st->input_history_pos = 0;
+  st->input_history_draft = NULL;
 
   st->win = gtk_application_window_new(app);
   /* Icons: use the one true icon everywhere (dev + installed). */
