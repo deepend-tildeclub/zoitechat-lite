@@ -84,9 +84,97 @@ static void refresh_network_combo(GtkComboBoxText *combo, const gchar *selected_
 static void on_userlist_menu_send_dm(GtkMenuItem *mi, gpointer user_data);
 static void on_userlist_menu_whois(GtkMenuItem *mi, gpointer user_data);
 static void on_userlist_menu_copy(GtkMenuItem *mi, gpointer user_data);
+static void on_about_zoitechat(GtkButton *btn, gpointer user_data);
+static void on_preferences(GtkButton *btn, gpointer user_data);
 
 static GtkEntry *host_combo_get_entry(GtkWidget *combo);
 static void host_combo_set_text(GtkWidget *combo, const gchar *text);
+
+typedef struct {
+  gchar *label;
+  GCallback callback;
+  gboolean is_separator;
+} ZcMenuEntry;
+
+static GPtrArray *menu_entries = NULL;
+
+static void
+menu_entry_free(gpointer data) {
+  ZcMenuEntry *entry = data;
+  if (!entry) return;
+  g_free(entry->label);
+  g_free(entry);
+}
+
+static void
+zc_ui_ensure_menu_registry(void) {
+  if (menu_entries) return;
+  menu_entries = g_ptr_array_new_with_free_func(menu_entry_free);
+}
+
+void
+zc_ui_register_menu_action(const gchar *label, GCallback callback) {
+  if (!label || !*label || !callback) return;
+  zc_ui_ensure_menu_registry();
+  ZcMenuEntry *entry = g_new0(ZcMenuEntry, 1);
+  entry->label = g_strdup(label);
+  entry->callback = callback;
+  g_ptr_array_add(menu_entries, entry);
+}
+
+void
+zc_ui_register_menu_separator(void) {
+  zc_ui_ensure_menu_registry();
+  ZcMenuEntry *entry = g_new0(ZcMenuEntry, 1);
+  entry->is_separator = TRUE;
+  g_ptr_array_add(menu_entries, entry);
+}
+
+static void
+zc_ui_register_default_menu_items(void) {
+  static gboolean defaults_registered = FALSE;
+  zc_ui_ensure_menu_registry();
+  if (defaults_registered) return;
+  zc_ui_register_menu_action("Preferences", G_CALLBACK(on_preferences));
+  zc_ui_register_menu_separator();
+  zc_ui_register_menu_action("About ZoiteChat", G_CALLBACK(on_about_zoitechat));
+  defaults_registered = TRUE;
+}
+
+static GtkWidget *
+zc_ui_build_menu_popover(UiState *st, GtkWidget *menu_btn) {
+  zc_ui_register_default_menu_items();
+  GtkWidget *popover = gtk_popover_new(menu_btn);
+  GtkWidget *vb = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+  gtk_container_set_border_width(GTK_CONTAINER(vb), 10);
+
+  if (!menu_entries || menu_entries->len == 0) {
+    GtkWidget *empty = gtk_label_new("No menu items");
+    gtk_widget_set_halign(empty, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(vb), empty, FALSE, FALSE, 0);
+  } else {
+    for (guint i = 0; i < menu_entries->len; i++) {
+      ZcMenuEntry *entry = g_ptr_array_index(menu_entries, i);
+      if (!entry) continue;
+      if (entry->is_separator) {
+        GtkWidget *sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+        gtk_box_pack_start(GTK_BOX(vb), sep, FALSE, FALSE, 0);
+        continue;
+      }
+      GtkWidget *btn = gtk_model_button_new();
+      gtk_button_set_label(GTK_BUTTON(btn), entry->label);
+      gtk_widget_set_halign(btn, GTK_ALIGN_START);
+      if (entry->callback) {
+        g_signal_connect(btn, "clicked", entry->callback, st);
+      }
+      gtk_box_pack_start(GTK_BOX(vb), btn, FALSE, FALSE, 0);
+    }
+  }
+
+  gtk_container_add(GTK_CONTAINER(popover), vb);
+  gtk_widget_show_all(popover);
+  return popover;
+}
 
 static void
 ui_update_connect_toggle_button(UiState *st) {
@@ -335,6 +423,46 @@ on_about_zoitechat(GtkButton *btn, gpointer user_data) {
   );
   gtk_widget_set_halign(lic, GTK_ALIGN_CENTER);
   gtk_box_pack_start(GTK_BOX(box), lic, FALSE, FALSE, 0);
+
+  gtk_widget_show_all(dlg);
+  gtk_dialog_run(GTK_DIALOG(dlg));
+  gtk_widget_destroy(dlg);
+}
+
+static void
+on_preferences(GtkButton *btn, gpointer user_data) {
+  (void)btn;
+  UiState *st = (UiState *)user_data;
+  if (!st || !st->win) return;
+
+  GtkWidget *pop = gtk_widget_get_ancestor(GTK_WIDGET(btn), GTK_TYPE_POPOVER);
+  if (pop) gtk_widget_hide(pop);
+
+  GtkWidget *dlg = gtk_dialog_new_with_buttons(
+    "Preferences",
+    GTK_WINDOW(st->win),
+    GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+    "_Close", GTK_RESPONSE_CLOSE,
+    NULL
+  );
+
+  ui_apply_window_icon(GTK_WINDOW(dlg));
+  g_signal_connect(dlg, "realize", G_CALLBACK(ui_apply_window_app_id), NULL);
+
+  GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
+  GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+  gtk_container_set_border_width(GTK_CONTAINER(box), 14);
+  gtk_container_add(GTK_CONTAINER(area), box);
+
+  GtkWidget *title = gtk_label_new(NULL);
+  gtk_label_set_markup(GTK_LABEL(title), "<b>Preferences</b>");
+  gtk_widget_set_halign(title, GTK_ALIGN_START);
+  gtk_box_pack_start(GTK_BOX(box), title, FALSE, FALSE, 0);
+
+  GtkWidget *note = gtk_label_new("Preferences live here. More options can be added as modules register new menu items.");
+  gtk_label_set_line_wrap(GTK_LABEL(note), TRUE);
+  gtk_widget_set_halign(note, GTK_ALIGN_START);
+  gtk_box_pack_start(GTK_BOX(box), note, FALSE, FALSE, 0);
 
   gtk_widget_show_all(dlg);
   gtk_dialog_run(GTK_DIALOG(dlg));
@@ -3179,17 +3307,7 @@ gtk_widget_set_tooltip_text(menu_btn, "Menu");
 gtk_header_bar_pack_end(GTK_HEADER_BAR(hb), menu_btn);
 st->menu_btn = menu_btn;
 
-GtkWidget *popover = gtk_popover_new(menu_btn);
-GtkWidget *vb = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-gtk_container_set_border_width(GTK_CONTAINER(vb), 10);
-GtkWidget *about_btn = gtk_model_button_new();
-gtk_button_set_label(GTK_BUTTON(about_btn), "About ZoiteChat");
-gtk_widget_set_halign(about_btn, GTK_ALIGN_START);
-g_signal_connect(about_btn, "clicked", G_CALLBACK(on_about_zoitechat), st);
-gtk_box_pack_start(GTK_BOX(vb), about_btn, FALSE, FALSE, 0);
-
-gtk_container_add(GTK_CONTAINER(popover), vb);
-gtk_widget_show_all(popover);
+GtkWidget *popover = zc_ui_build_menu_popover(st, menu_btn);
 gtk_menu_button_set_popover(GTK_MENU_BUTTON(menu_btn), popover);
 
 set_status(st, zc_client_is_connected(st->client) ? "Connected" : "Disconnected");
