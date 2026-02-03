@@ -515,16 +515,16 @@ on_client_connected(ZcClient *client, UiState *st) {
     g_clear_error(&error);
     return;
   }
-/* Joining before registration completes is unreliable across servers.
- * Queue auto-join and perform it after we receive 001 / end-of-MOTD.
- */
-st->autojoin_pending = TRUE;
-if (st->auto_join && *st->auto_join) {
-  chat_page_append_fmt(status, "Auto-join queued: %s", st->auto_join);
-  ui_update_connect_toggle_button(st);
-
-}
+  /* Joining before registration completes is unreliable across servers.
+   * Queue auto-join and perform it after we receive 001 / end-of-MOTD.
+   */
+  st->autojoin_pending = TRUE;
+  if (st->auto_join && *st->auto_join) {
+    chat_page_append_fmt(status, "Auto-join queued: %s", st->auto_join);
   }
+
+  ui_update_connect_toggle_button(st);
+}
 
 
 static void zcl_whois_clear(void);
@@ -2512,4 +2512,3 @@ set_status(st, zc_client_is_connected(st->client) ? "Connected" : "Disconnected"
   gtk_widget_show_all(st->win);
   return st->win;
 }
-
