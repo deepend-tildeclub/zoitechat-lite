@@ -1907,13 +1907,13 @@ host_combo_set_text(GtkWidget *combo, const gchar *text) {
   gtk_entry_set_text(entry, text ? text : "");
 }
 
-static const ZcServlistNetwork *
+static ZcServlistNetwork *
 servlist_find_network_by_name(const gchar *name) {
   if (!name || !*name) return NULL;
   gsize count = 0;
   const ZcServlistNetwork *const *nets = zc_servlist_get_networks(&count);
   for (gsize i = 0; i < count; i++) {
-    const ZcServlistNetwork *net = nets[i];
+    ZcServlistNetwork *net = (ZcServlistNetwork *)nets[i];
     const gchar *net_name = zc_servlist_network_get_name(net);
     if (g_strcmp0(net_name, name) == 0) return net;
   }
@@ -1972,19 +1972,31 @@ servlist_refresh_server_list(GtkListBox *list, const ZcServlistNetwork *net) {
   gtk_widget_show_all(GTK_WIDGET(list));
 }
 
-static void
-on_servlist_network_selected(GtkListBox *box, GtkListBoxRow *row, gpointer user_data) {
-  (void)box;
-  GtkListBox *server_list = GTK_LIST_BOX(user_data);
-  const ZcServlistNetwork *net = row ? g_object_get_data(G_OBJECT(row), "zc-net") : NULL;
-  servlist_refresh_server_list(server_list, net);
-}
-
 typedef struct {
   GtkWindow *parent;
   GtkListBox *net_list;
   GtkListBox *srv_list;
+  GtkEntry *auto_join_entry;
 } ServlistDialogState;
+
+static void servlist_on_auto_join_changed(GtkEntry *entry, gpointer user_data);
+
+static void
+on_servlist_network_selected(GtkListBox *box, GtkListBoxRow *row, gpointer user_data) {
+  (void)box;
+  ServlistDialogState *state = user_data;
+  GtkListBox *server_list = state->srv_list;
+  const ZcServlistNetwork *net = row ? g_object_get_data(G_OBJECT(row), "zc-net") : NULL;
+  servlist_refresh_server_list(server_list, net);
+  if (state->auto_join_entry) {
+    const gchar *auto_join = net ? zc_servlist_network_get_auto_join(net) : NULL;
+    const gchar *fallback = net ? zc_servlist_network_get_default_channel(net) : NULL;
+    const gchar *value = auto_join ? auto_join : (fallback ? fallback : "");
+    g_signal_handlers_block_by_func(state->auto_join_entry, G_CALLBACK(servlist_on_auto_join_changed), state);
+    gtk_entry_set_text(state->auto_join_entry, value);
+    g_signal_handlers_unblock_by_func(state->auto_join_entry, G_CALLBACK(servlist_on_auto_join_changed), state);
+  }
+}
 
 static ZcServlistNetwork *
 servlist_selected_network(ServlistDialogState *state) {
@@ -2093,6 +2105,17 @@ servlist_on_remove_server(GtkButton *btn, gpointer user_data) {
 }
 
 static void
+servlist_on_auto_join_changed(GtkEntry *entry, gpointer user_data) {
+  ServlistDialogState *state = user_data;
+  ZcServlistNetwork *net = servlist_selected_network(state);
+  if (!net) return;
+  const gchar *text = gtk_entry_get_text(entry);
+  if (zc_servlist_network_set_auto_join(net, text)) {
+    zc_servlist_save();
+  }
+}
+
+static void
 servlist_manage_dialog(UiState *st) {
   GtkWidget *dlg = gtk_dialog_new_with_buttons(
     "Server List",
@@ -2143,6 +2166,12 @@ servlist_manage_dialog(UiState *st) {
   gtk_grid_attach(GTK_GRID(grid), net_btns, 0, 2, 1, 1);
   gtk_grid_attach(GTK_GRID(grid), srv_btns, 1, 2, 1, 1);
 
+  GtkWidget *auto_join_label = gtk_label_new("Auto-join");
+  gtk_label_set_xalign(GTK_LABEL(auto_join_label), 0.0f);
+  GtkWidget *auto_join_entry = gtk_entry_new();
+  gtk_grid_attach(GTK_GRID(grid), auto_join_label, 0, 3, 1, 1);
+  gtk_grid_attach(GTK_GRID(grid), auto_join_entry, 1, 3, 1, 1);
+
   GtkWidget *net_add = gtk_button_new_with_label("Add");
   GtkWidget *net_edit = gtk_button_new_with_label("Rename");
   GtkWidget *net_remove = gtk_button_new_with_label("Remove");
@@ -2161,16 +2190,18 @@ servlist_manage_dialog(UiState *st) {
     .parent = GTK_WINDOW(st->win),
     .net_list = GTK_LIST_BOX(net_list),
     .srv_list = GTK_LIST_BOX(srv_list),
+    .auto_join_entry = GTK_ENTRY(auto_join_entry),
   };
 
   servlist_refresh_network_list(state.net_list);
-  g_signal_connect(net_list, "row-selected", G_CALLBACK(on_servlist_network_selected), srv_list);
+  g_signal_connect(net_list, "row-selected", G_CALLBACK(on_servlist_network_selected), &state);
   g_signal_connect(net_add, "clicked", G_CALLBACK(servlist_on_add_network), &state);
   g_signal_connect(net_edit, "clicked", G_CALLBACK(servlist_on_rename_network), &state);
   g_signal_connect(net_remove, "clicked", G_CALLBACK(servlist_on_remove_network), &state);
   g_signal_connect(srv_add, "clicked", G_CALLBACK(servlist_on_add_server), &state);
   g_signal_connect(srv_edit, "clicked", G_CALLBACK(servlist_on_edit_server), &state);
   g_signal_connect(srv_remove, "clicked", G_CALLBACK(servlist_on_remove_server), &state);
+  g_signal_connect(auto_join_entry, "changed", G_CALLBACK(servlist_on_auto_join_changed), &state);
 
   gtk_widget_show_all(dlg);
   gtk_dialog_run(GTK_DIALOG(dlg));
@@ -2237,11 +2268,10 @@ on_network_changed(GtkComboBox *combo, gpointer user_data) {
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(tls), resolved_tls);
 
   if (join) {
+    const gchar *auto_join = zc_servlist_network_get_auto_join(net);
     const gchar *default_chan = zc_servlist_network_get_default_channel(net);
-    const gchar *current = gtk_entry_get_text(GTK_ENTRY(join));
-    if (default_chan && (!current || !*current)) {
-      gtk_entry_set_text(GTK_ENTRY(join), default_chan);
-    }
+    const gchar *value = auto_join ? auto_join : (default_chan ? default_chan : "");
+    gtk_entry_set_text(GTK_ENTRY(join), value);
   }
 }
 
@@ -2432,6 +2462,17 @@ connect_dialog(UiState *st) {
     st->user = g_strdup(gtk_entry_get_text(GTK_ENTRY(user)));
     st->realname = g_strdup(gtk_entry_get_text(GTK_ENTRY(real)));
     st->auto_join = g_strdup(gtk_entry_get_text(GTK_ENTRY(join)));
+
+    gchar *selected = gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(network));
+    if (selected && g_strcmp0(selected, "Custom") != 0) {
+      ZcServlistNetwork *net = servlist_find_network_by_name(selected);
+      if (net) {
+        if (zc_servlist_network_set_auto_join(net, st->auto_join)) {
+          zc_servlist_save();
+        }
+      }
+    }
+    g_free(selected);
 
     if (st->settings) {
       g_free(st->settings->host); st->settings->host = g_strdup(st->host);

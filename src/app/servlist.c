@@ -7,6 +7,7 @@ struct _ZcServlistNetwork {
   gchar *name;
   GPtrArray *servers;
   gchar *default_channel;
+  gchar *auto_join;
   gchar *charset;
   gboolean default_tls;
 };
@@ -292,6 +293,7 @@ zc_servlist_network_free(ZcServlistNetwork *net) {
     g_ptr_array_free(net->servers, TRUE);
   }
   g_free(net->default_channel);
+  g_free(net->auto_join);
   g_free(net->charset);
   g_free(net);
 }
@@ -369,6 +371,9 @@ zc_servlist_load(void) {
       if (g_key_file_has_key(kf, group, "default_channel", NULL)) {
         net->default_channel = g_key_file_get_string(kf, group, "default_channel", NULL);
       }
+      if (g_key_file_has_key(kf, group, "auto_join", NULL)) {
+        net->auto_join = g_key_file_get_string(kf, group, "auto_join", NULL);
+      }
       if (g_key_file_has_key(kf, group, "charset", NULL)) {
         net->charset = g_key_file_get_string(kf, group, "charset", NULL);
       }
@@ -422,6 +427,11 @@ zc_servlist_network_get_default_server(const ZcServlistNetwork *net) {
 const gchar *
 zc_servlist_network_get_default_channel(const ZcServlistNetwork *net) {
   return net ? net->default_channel : NULL;
+}
+
+const gchar *
+zc_servlist_network_get_auto_join(const ZcServlistNetwork *net) {
+  return net ? net->auto_join : NULL;
 }
 
 const gchar *const *
@@ -545,6 +555,14 @@ zc_servlist_network_remove_server(ZcServlistNetwork *net, gsize idx) {
 }
 
 gboolean
+zc_servlist_network_set_auto_join(ZcServlistNetwork *net, const gchar *auto_join) {
+  if (!net) return FALSE;
+  g_free(net->auto_join);
+  net->auto_join = (auto_join && *auto_join) ? g_strdup(auto_join) : NULL;
+  return TRUE;
+}
+
+gboolean
 zc_servlist_save(void) {
   zc_servlist_load();
   if (!zc_servlist_networks) return FALSE;
@@ -559,6 +577,8 @@ zc_servlist_save(void) {
     g_key_file_set_string_list(kf, group, "servers", servers, server_count);
     if (net->default_channel)
       g_key_file_set_string(kf, group, "default_channel", net->default_channel);
+    if (net->auto_join)
+      g_key_file_set_string(kf, group, "auto_join", net->auto_join);
     if (net->charset)
       g_key_file_set_string(kf, group, "charset", net->charset);
     g_key_file_set_boolean(kf, group, "tls", net->default_tls);
